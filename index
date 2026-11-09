@@ -1,0 +1,1509 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Portfólio | Brother</title>
+
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+        :root {
+            --bg: #0a0b0d;
+            --surface: #15171b;
+            --surface-alt: #1b1e23;
+            --line: rgba(255,255,255,0.09);
+            --ink: #edf1f0;
+            --muted: #8d959e;
+            --accent: #ff5a1f;
+            --accent-ink: #170700;
+            --radius: 12px;
+            --radius-sm: 8px;
+        }
+
+        * {
+            box-sizing: border-box;
+            scroll-behavior: smooth;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                transition: none !important;
+                scroll-behavior: auto !important;
+            }
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            color: var(--ink);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: var(--bg);
+            overflow-x: hidden;
+        }
+
+        a {
+            color: inherit;
+            text-decoration: none;
+        }
+
+        button,
+        input {
+            font: inherit;
+        }
+
+        a:focus-visible,
+        button:focus-visible,
+        [contenteditable]:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        .container {
+            width: min(1180px, calc(100% - 32px));
+            margin: 0 auto;
+        }
+
+        .topbar {
+            position: sticky;
+            top: 0;
+            z-index: 50;
+            background: rgba(10, 11, 13, 0.92);
+            border-bottom: 1px solid var(--line);
+        }
+
+        .topbar-inner {
+            min-height: 72px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-family: "Space Grotesk", sans-serif;
+            font-weight: 700;
+            letter-spacing: 0.1px;
+        }
+
+        .brand-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 2px;
+            background: var(--accent);
+        }
+
+        .nav {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .nav a {
+            color: var(--muted);
+            font-size: 0.94rem;
+            padding: 9px 11px;
+            border-radius: 6px;
+            transition: 0.2s ease;
+        }
+
+        .nav a:hover {
+            color: var(--ink);
+            background: var(--surface);
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .tool-btn {
+            border: 1px solid var(--line);
+            color: var(--ink);
+            background: var(--surface);
+            padding: 9px 13px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: 0.2s ease;
+        }
+
+        .tool-btn:hover {
+            border-color: rgba(255,255,255,0.22);
+            background: var(--surface-alt);
+        }
+
+        .edit-btn {
+            border: 1px solid var(--accent);
+            background: var(--accent);
+            color: var(--accent-ink);
+            font-weight: 700;
+        }
+
+        .edit-btn:hover {
+            background: #ff7238;
+        }
+
+        .hero {
+            padding: 82px 0 34px;
+        }
+
+        .hero-grid {
+            display: grid;
+            grid-template-columns: 1.08fr 0.92fr;
+            gap: 28px;
+            align-items: stretch;
+        }
+
+        .hero-card,
+        .media-card,
+        .section-card,
+        .project-card,
+        .contact-card {
+            background: var(--surface);
+            border: 1px solid var(--line);
+        }
+
+        .hero-card {
+            min-height: 520px;
+            border-radius: var(--radius);
+            padding: clamp(28px, 5vw, 54px);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+            background-image: radial-gradient(circle, rgba(255,255,255,0.07) 1px, transparent 1px);
+            background-size: 22px 22px;
+            background-position: -6px -6px;
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            width: fit-content;
+            align-items: center;
+            padding: 6px 0 6px 12px;
+            border-left: 2px solid var(--accent);
+            color: var(--muted);
+            font-size: 0.82rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            margin-bottom: 18px;
+        }
+
+        .hero h1 {
+            margin: 0;
+            font-family: "Space Grotesk", sans-serif;
+            font-weight: 600;
+            font-size: clamp(2.5rem, 5vw, 4.6rem);
+            line-height: 1.02;
+            letter-spacing: -0.02em;
+        }
+
+        .hero h1 span {
+            color: var(--accent);
+        }
+
+        .hero-subtitle {
+            margin: 20px 0 0;
+            color: var(--muted);
+            font-size: clamp(1.06rem, 2vw, 1.2rem);
+            line-height: 1.75;
+            max-width: 640px;
+            white-space: pre-line;
+        }
+
+        .hero-actions {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin-top: 28px;
+        }
+
+        .primary-link,
+        .ghost-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 46px;
+            padding: 0 18px;
+            border-radius: 8px;
+            font-weight: 700;
+            transition: 0.2s ease;
+        }
+
+        .primary-link {
+            color: var(--accent-ink);
+            background: var(--accent);
+        }
+
+        .ghost-link {
+            border: 1px solid var(--line);
+            background: transparent;
+            color: var(--ink);
+        }
+
+        .primary-link:hover {
+            background: #ff7238;
+        }
+
+        .ghost-link:hover {
+            border-color: rgba(255,255,255,0.3);
+            background: var(--surface);
+        }
+
+        .media-card {
+            min-height: 520px;
+            border-radius: var(--radius);
+            overflow: hidden;
+            position: relative;
+        }
+
+        .image-frame {
+            position: absolute;
+            inset: 0;
+            background: #0d0e10;
+        }
+
+        .image-frame img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .empty-media {
+            width: 100%;
+            height: 100%;
+            display: grid;
+            place-items: center;
+            color: var(--muted);
+            padding: 30px;
+            text-align: center;
+        }
+
+        .media-label {
+            position: absolute;
+            left: 18px;
+            bottom: 18px;
+            z-index: 2;
+            max-width: calc(100% - 36px);
+            padding: 8px 12px;
+            border-radius: 6px;
+            background: rgba(10,11,13,0.85);
+            border: 1px solid var(--line);
+            font-size: 0.85rem;
+            color: var(--ink);
+        }
+
+        .edit-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 5;
+            display: none;
+            align-items: flex-end;
+            justify-content: center;
+            padding: 20px;
+            background: linear-gradient(to top, rgba(0,0,0,0.75), transparent 48%);
+        }
+
+        .edit-mode .edit-overlay {
+            display: flex;
+        }
+
+        .media-edit-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 11px 15px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            color: var(--ink);
+            background: rgba(10,11,13,0.9);
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .section {
+            padding: 42px 0;
+        }
+
+        .section-heading {
+            display: flex;
+            align-items: end;
+            justify-content: space-between;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .section-heading h2 {
+            margin: 0;
+            font-family: "Space Grotesk", sans-serif;
+            font-weight: 600;
+            font-size: clamp(1.65rem, 3vw, 2.2rem);
+        }
+
+        .section-heading p {
+            margin: 7px 0 0;
+            color: var(--muted);
+        }
+
+        .section-card {
+            border-radius: var(--radius);
+            padding: 28px;
+        }
+
+        .about-grid {
+            display: grid;
+            grid-template-columns: 1.35fr 0.65fr;
+            gap: 20px;
+        }
+
+        .about-text {
+            margin: 0;
+            color: #dfe3e2;
+            line-height: 1.9;
+            white-space: pre-line;
+        }
+
+        .stats {
+            display: grid;
+            gap: 12px;
+        }
+
+        .stat {
+            padding: 16px;
+            border-radius: var(--radius-sm);
+            background: var(--surface-alt);
+            border: 1px solid var(--line);
+        }
+
+        .stat strong {
+            display: block;
+            font-family: "Space Grotesk", sans-serif;
+            font-size: 1.35rem;
+            margin-bottom: 4px;
+        }
+
+        .stat span {
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+
+        .carousel-wrapper {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        .carousel-track {
+            display: flex;
+            gap: 18px;
+            overflow-x: auto;
+            scroll-snap-type: x mandatory;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+            padding: 4px 0;
+        }
+
+        .carousel-track::-webkit-scrollbar {
+            display: none;
+        }
+
+        .project-card {
+            flex: 0 0 calc(33.333% - 12px);
+            scroll-snap-align: start;
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            transition: 0.2s ease;
+        }
+
+        .project-card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(255,255,255,0.22);
+        }
+
+        .carousel-arrow {
+            position: absolute;
+            z-index: 10;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            color: var(--ink);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: 0.2s ease;
+        }
+
+        .carousel-arrow:hover {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: var(--accent-ink);
+        }
+
+        .carousel-arrow.prev { left: -21px; }
+        .carousel-arrow.next { right: -21px; }
+
+        .project-image {
+            aspect-ratio: 16 / 10;
+            position: relative;
+            background: #0d0e10;
+        }
+
+        .project-image img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: none;
+        }
+
+        .project-empty {
+            display: grid;
+            place-items: center;
+            height: 100%;
+            color: var(--muted);
+            font-size: 0.92rem;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .project-body {
+            padding: 18px;
+        }
+
+        .project-body h3 {
+            margin: 0 0 8px;
+            font-family: "Space Grotesk", sans-serif;
+            font-size: 1.08rem;
+        }
+
+        .project-body p {
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.65;
+            white-space: pre-line;
+        }
+
+        .project-link {
+            display: inline-flex;
+            margin-top: 14px;
+            color: var(--accent);
+            font-weight: 700;
+            font-size: 0.92rem;
+        }
+
+        .showreel {
+            display: grid;
+            grid-template-columns: 1.15fr 0.85fr;
+            gap: 20px;
+        }
+
+        .video-card {
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            background: #08090a;
+            border: 1px solid var(--line);
+            min-height: 360px;
+            position: relative;
+            display: grid;
+            place-items: center;
+        }
+
+        .video-card video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: none;
+        }
+
+        .video-empty {
+            color: var(--muted);
+            text-align: center;
+            padding: 32px;
+        }
+
+        .showreel-copy {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            padding: 14px 10px 14px 0;
+        }
+
+        .showreel-copy h3 {
+            font-family: "Space Grotesk", sans-serif;
+            font-weight: 600;
+        }
+
+        .showreel-copy p {
+            color: var(--muted);
+            line-height: 1.8;
+            white-space: pre-line;
+        }
+
+        .contact-card {
+            border-radius: var(--radius);
+            padding: clamp(25px, 4vw, 40px);
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        .contact-block h3 {
+            margin: 0 0 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--muted);
+        }
+
+        .contact-value {
+            margin: 0;
+            font-family: "Space Grotesk", sans-serif;
+            font-size: clamp(1.15rem, 3vw, 1.6rem);
+            font-weight: 600;
+            white-space: pre-line;
+        }
+
+        .footer {
+            padding: 24px 0 48px;
+            color: var(--muted);
+            text-align: center;
+            font-size: 0.9rem;
+        }
+
+        .admin-only {
+            display: none !important;
+        }
+
+        body.admin-authenticated .admin-only {
+            display: inline-flex !important;
+        }
+
+        .editable {
+            transition: 0.2s ease;
+            border-radius: 6px;
+        }
+
+        .edit-mode .editable {
+            outline: 2px dashed var(--accent);
+            outline-offset: 5px;
+            cursor: text;
+        }
+
+        .edit-mode .editable:hover {
+            background: rgba(255, 90, 31, 0.08);
+        }
+
+        .editor-hint {
+            position: fixed;
+            left: 50%;
+            bottom: 18px;
+            transform: translateX(-50%);
+            z-index: 60;
+            display: none;
+            max-width: calc(100% - 24px);
+            padding: 11px 15px;
+            border-radius: 8px;
+            color: var(--ink);
+            background: rgba(10,11,13,0.95);
+            border: 1px solid var(--line);
+            text-align: center;
+            font-size: 0.9rem;
+        }
+
+        .edit-mode .editor-hint {
+            display: block;
+        }
+
+        .lang-switch {
+            display: flex;
+            align-items: center;
+            padding: 3px;
+            border-radius: 8px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+        }
+
+        .lang-switch button {
+            border: none;
+            background: transparent;
+            color: var(--muted);
+            padding: 7px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 700;
+        }
+
+        .lang-switch button.active {
+            color: var(--accent-ink);
+            background: var(--accent);
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        @media (max-width: 980px) {
+            .nav { display: none; }
+            .hero-grid, .showreel, .about-grid, .contact-card { grid-template-columns: 1fr; }
+            .hero-card, .media-card { min-height: 430px; }
+            .project-card { flex: 0 0 calc(50% - 9px); }
+        }
+
+        @media (max-width: 620px) {
+            .container { width: min(100% - 20px, 1180px); }
+            .topbar-inner { min-height: 66px; }
+            .brand { font-size: 0.9rem; }
+            .tool-btn { padding: 8px 10px; }
+            .hero { padding-top: 34px; }
+            .hero-card, .media-card { min-height: 360px; }
+            .section-card { padding: 21px; }
+            .project-card { flex: 0 0 100%; }
+            .carousel-arrow { display: none; }
+        }
+    </style>
+</head>
+
+<body>
+
+<header class="topbar">
+    <div class="container topbar-inner">
+        <a href="#home" class="brand">
+            <span class="brand-dot"></span>
+            <span class="editable" data-key="brand">Seu Nome</span>
+        </a>
+
+        <nav class="nav" aria-label="Navegação">
+            <a href="#about" data-ui="navAbout">Sobre</a>
+            <a href="#projects" data-ui="navProjects">Projetos</a>
+            <a href="#showreel" data-ui="navShowreel">Showreel</a>
+            <a href="#contact" data-ui="navContact">Contato</a>
+        </nav>
+
+        <div class="toolbar">
+            <div class="lang-switch" aria-label="Idioma">
+                <button type="button" id="langEN">EN</button>
+                <button type="button" id="langPT">PT</button>
+            </div>
+            <button type="button" class="tool-btn edit-btn admin-only" id="toggleEditBtn">Editar</button>
+        </div>
+    </div>
+</header>
+
+<main id="home">
+    <section class="hero">
+        <div class="container hero-grid">
+            <div class="hero-card">
+                <span class="eyebrow editable" data-key="eyebrow">3D DESIGNER</span>
+
+                <h1 class="editable" data-key="heroTitle">Olá, sou <span>Seu Nome</span></h1>
+
+                <p class="hero-subtitle editable" data-key="heroSubtitle">
+                    Sou designer 3D com 4 anos de experiência.
+                    Crio projetos visuais com foco em qualidade, detalhe e personalidade.
+                </p>
+
+                <div class="hero-actions">
+                    <a class="primary-link" href="#projects" data-ui="heroButtonProjects">Ver projetos</a>
+                    <a class="ghost-link" href="#contact" data-ui="heroButtonContact">Entrar em contato</a>
+                </div>
+            </div>
+
+            <div class="media-card" id="mainImageBox">
+                <div class="image-frame">
+                    <div class="empty-media" id="mainImageEmpty">
+                        <div>
+                            <strong data-ui="imagePlaceholderTitle">Sua imagem principal</strong><br>
+                            <span data-ui="imagePlaceholderText">Ative a edição para colocar uma imagem aqui.</span>
+                        </div>
+                    </div>
+                    <img id="mainImage" alt="Imagem principal do portfólio">
+                </div>
+
+                <div class="media-label editable" data-key="mainImageCaption">
+                    Imagem principal / trabalho em destaque
+                </div>
+
+                <div class="edit-overlay">
+                    <label class="media-edit-btn" for="mainImageInput"><span data-ui="changeImage">Trocar imagem</span></label>
+                    <input type="file" id="mainImageInput" accept="image/*">
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="about">
+        <div class="container">
+            <div class="section-heading">
+                <div>
+                    <h2 data-ui="aboutTitle">Sobre mim</h2>
+                    <p data-ui="aboutSubtitle">Um resumo rápido sobre o trabalho.</p>
+                </div>
+            </div>
+
+            <div class="section-card about-grid">
+                <div>
+                    <p class="about-text editable" data-key="aboutText">
+Tenho experiência criando trabalhos em 3D e gosto de transformar ideias em imagens com identidade.
+
+Este espaço pode ser usado para falar sobre experiência, estilo, ferramentas, clientes ou qualquer outra informação importante.
+                    </p>
+                </div>
+
+                <div class="stats">
+                    <div class="stat">
+                        <strong class="editable" data-key="stat1Value">4+</strong>
+                        <span class="editable" data-key="stat1Label">anos de experiência</span>
+                    </div>
+                    <div class="stat">
+                        <strong class="editable" data-key="stat2Value">3D</strong>
+                        <span class="editable" data-key="stat2Label">área principal</span>
+                    </div>
+                    <div class="stat">
+                        <strong class="editable" data-key="stat3Value">100%</strong>
+                        <span class="editable" data-key="stat3Label">foco no projeto</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="projects">
+        <div class="container">
+            <div class="section-heading">
+                <div>
+                    <h2 data-ui="projectsTitle">Projetos</h2>
+                    <p data-ui="projectsSubtitle">Alguns dos trabalhos que podem aparecer aqui.</p>
+                </div>
+            </div>
+
+            <div class="carousel-wrapper">
+                <button class="carousel-arrow prev" aria-label="Anterior">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+                </button>
+                
+                <div class="carousel-track" id="projectTrack">
+                    <!-- Projeto 1 -->
+                    <article class="project-card">
+                        <div class="project-image">
+                            <div class="project-empty" id="projectEmpty1">Imagem do projeto</div>
+                            <img id="projectImage1" alt="Projeto 1">
+                            <div class="edit-overlay">
+                                <label class="media-edit-btn" for="projectInput1"><span data-ui="changeImage">Trocar imagem</span></label>
+                                <input type="file" id="projectInput1" accept="image/*">
+                            </div>
+                        </div>
+                        <div class="project-body">
+                            <h3 class="editable" data-key="project1Title">Projeto 01</h3>
+                            <p class="editable" data-key="project1Description">Descrição do projeto, objetivo e principais detalhes.</p>
+                            <span class="project-link editable" data-key="project1Link">Ver projeto →</span>
+                        </div>
+                    </article>
+
+                    <!-- Projeto 2 -->
+                    <article class="project-card">
+                        <div class="project-image">
+                            <div class="project-empty" id="projectEmpty2">Imagem do projeto</div>
+                            <img id="projectImage2" alt="Projeto 2">
+                            <div class="edit-overlay">
+                                <label class="media-edit-btn" for="projectInput2"><span data-ui="changeImage">Trocar imagem</span></label>
+                                <input type="file" id="projectInput2" accept="image/*">
+                            </div>
+                        </div>
+                        <div class="project-body">
+                            <h3 class="editable" data-key="project2Title">Projeto 02</h3>
+                            <p class="editable" data-key="project2Description">Descrição do projeto, objetivo e principais detalhes.</p>
+                            <span class="project-link editable" data-key="project2Link">Ver projeto →</span>
+                        </div>
+                    </article>
+
+                    <!-- Projeto 3 -->
+                    <article class="project-card">
+                        <div class="project-image">
+                            <div class="project-empty" id="projectEmpty3">Imagem do projeto</div>
+                            <img id="projectImage3" alt="Projeto 3">
+                            <div class="edit-overlay">
+                                <label class="media-edit-btn" for="projectInput3"><span data-ui="changeImage">Trocar imagem</span></label>
+                                <input type="file" id="projectInput3" accept="image/*">
+                            </div>
+                        </div>
+                        <div class="project-body">
+                            <h3 class="editable" data-key="project3Title">Projeto 03</h3>
+                            <p class="editable" data-key="project3Description">Descrição do projeto, objetivo e principais detalhes.</p>
+                            <span class="project-link editable" data-key="project3Link">Ver projeto →</span>
+                        </div>
+                    </article>
+                    
+                    <!-- Projeto 4 -->
+                    <article class="project-card">
+                        <div class="project-image">
+                            <div class="project-empty" id="projectEmpty4">Imagem do projeto</div>
+                            <img id="projectImage4" alt="Projeto 4">
+                            <div class="edit-overlay">
+                                <label class="media-edit-btn" for="projectInput4"><span data-ui="changeImage">Trocar imagem</span></label>
+                                <input type="file" id="projectInput4" accept="image/*">
+                            </div>
+                        </div>
+                        <div class="project-body">
+                            <h3 class="editable" data-key="project4Title">Projeto 04</h3>
+                            <p class="editable" data-key="project4Description">Descrição do projeto, objetivo e principais detalhes.</p>
+                            <span class="project-link editable" data-key="project4Link">Ver projeto →</span>
+                        </div>
+                    </article>
+
+                    <!-- Projeto 5 -->
+                    <article class="project-card">
+                        <div class="project-image">
+                            <div class="project-empty" id="projectEmpty5">Imagem do projeto</div>
+                            <img id="projectImage5" alt="Projeto 5">
+                            <div class="edit-overlay">
+                                <label class="media-edit-btn" for="projectInput5"><span data-ui="changeImage">Trocar imagem</span></label>
+                                <input type="file" id="projectInput5" accept="image/*">
+                            </div>
+                        </div>
+                        <div class="project-body">
+                            <h3 class="editable" data-key="project5Title">Projeto 05</h3>
+                            <p class="editable" data-key="project5Description">Descrição do projeto, objetivo e principais detalhes.</p>
+                            <span class="project-link editable" data-key="project5Link">Ver projeto →</span>
+                        </div>
+                    </article>
+
+                    <!-- Projeto 6 -->
+                    <article class="project-card">
+                        <div class="project-image">
+                            <div class="project-empty" id="projectEmpty6">Imagem do projeto</div>
+                            <img id="projectImage6" alt="Projeto 6">
+                            <div class="edit-overlay">
+                                <label class="media-edit-btn" for="projectInput6"><span data-ui="changeImage">Trocar imagem</span></label>
+                                <input type="file" id="projectInput6" accept="image/*">
+                            </div>
+                        </div>
+                        <div class="project-body">
+                            <h3 class="editable" data-key="project6Title">Projeto 06</h3>
+                            <p class="editable" data-key="project6Description">Descrição do projeto, objetivo e principais detalhes.</p>
+                            <span class="project-link editable" data-key="project6Link">Ver projeto →</span>
+                        </div>
+                    </article>
+
+                    <!-- Projeto 7 -->
+                    <article class="project-card">
+                        <div class="project-image">
+                            <div class="project-empty" id="projectEmpty7">Imagem do projeto</div>
+                            <img id="projectImage7" alt="Projeto 7">
+                            <div class="edit-overlay">
+                                <label class="media-edit-btn" for="projectInput7"><span data-ui="changeImage">Trocar imagem</span></label>
+                                <input type="file" id="projectInput7" accept="image/*">
+                            </div>
+                        </div>
+                        <div class="project-body">
+                            <h3 class="editable" data-key="project7Title">Projeto 07</h3>
+                            <p class="editable" data-key="project7Description">Descrição do projeto, objetivo e principais detalhes.</p>
+                            <span class="project-link editable" data-key="project7Link">Ver projeto →</span>
+                        </div>
+                    </article>
+                </div>
+
+                <button class="carousel-arrow next" aria-label="Próximo">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+                </button>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="showreel">
+        <div class="container">
+            <div class="section-heading">
+                <div>
+                    <h2 data-ui="showreelTitle">Showreel</h2>
+                    <p data-ui="showreelSubtitle">Um vídeo para apresentar o trabalho de forma mais visual.</p>
+                </div>
+            </div>
+
+            <div class="section-card showreel">
+                <div class="video-card">
+                    <div class="video-empty" id="videoEmpty">
+                        <strong data-ui="videoPlaceholderTitle">Seu vídeo aqui</strong><br>
+                        <span data-ui="videoPlaceholderText">Ative a edição para carregar um showreel.</span>
+                    </div>
+                    <video id="showreelVideo" controls playsinline></video>
+
+                    <div class="edit-overlay">
+                        <label class="media-edit-btn" for="videoInput"><span data-ui="changeVideo">Trocar vídeo</span></label>
+                        <input type="file" id="videoInput" accept="video/*">
+                    </div>
+                </div>
+
+                <div class="showreel-copy">
+                    <h3 class="editable" data-key="showreelTextTitle">Mostre seu processo.</h3>
+                    <p class="editable" data-key="showreelText">
+Use este espaço para explicar o que aparece no vídeo, apresentar uma animação, uma sequência de trabalhos ou um making of.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section" id="contact">
+        <div class="container">
+            <div class="section-heading">
+                <div>
+                    <h2 data-ui="contactTitle">Contato</h2>
+                    <p data-ui="contactSubtitle">Deixe as formas de contato que deseja divulgar.</p>
+                </div>
+            </div>
+
+            <div class="contact-card">
+                <div class="contact-block">
+                    <h3 data-ui="phoneLabel">Telefone</h3>
+                    <p class="contact-value editable" data-key="phoneValue">+55 (00) 00000-0000</p>
+                </div>
+
+                <div class="contact-block">
+                    <h3 data-ui="discordLabel">Discord</h3>
+                    <p class="contact-value editable" data-key="discordValue">@seuusuario</p>
+                </div>
+
+                <div class="contact-block">
+                    <h3 data-ui="emailLabel">E-mail</h3>
+                    <p class="contact-value editable" data-key="emailValue">seuemail@exemplo.com</p>
+                </div>
+
+                <div class="contact-block">
+                    <h3 data-ui="contactMessageLabel">Mensagem</h3>
+                    <p class="contact-value editable" data-key="contactMessage">Faço cada projeto com atenção aos detalhes.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+</main>
+
+<footer class="footer">
+    <div class="container">
+        <span class="editable" data-key="footerText">© 2026 Seu Nome — Portfólio.</span>
+    </div>
+</footer>
+
+<div class="editor-hint" data-ui="editHint">
+    Modo de edição ativo: clique nos textos contornados para editar. Nas imagens e vídeo, use os botões que aparecem.
+</div>
+
+<script>
+    /*
+     * PORTFÓLIO ONLINE
+     * ----------------
+     * O botão "Editar" só aparece após o servidor confirmar
+     * uma sessão de proprietário através de uma URL secreta.
+     *
+     * IMPORTANTE:
+     * - Não existe senha/campo de login no site público.
+     * - A autorização REAL acontece no backend.
+     * - Textos são renderizados com textContent.
+     * - Uploads passam pelo backend e não são gravados no browser.
+     */
+
+    let currentLanguage = localStorage.getItem("portfolio_language") || "pt";
+    let editMode = false;
+    let authenticated = false;
+    let siteData = { texts: { pt: {}, en: {} }, media: {} };
+
+    const UI = {
+        pt: {
+            navAbout: "Sobre",
+            navProjects: "Projetos",
+            navShowreel: "Showreel",
+            navContact: "Contato",
+            heroButtonProjects: "Ver projetos",
+            heroButtonContact: "Entrar em contato",
+            imagePlaceholderTitle: "Sua imagem principal",
+            imagePlaceholderText: "Ative a edição para colocar uma imagem aqui.",
+            changeImage: "Trocar imagem",
+            aboutTitle: "Sobre mim",
+            aboutSubtitle: "Um resumo rápido sobre o trabalho.",
+            projectsTitle: "Projetos",
+            projectsSubtitle: "Alguns dos trabalhos que podem aparecer aqui.",
+            showreelTitle: "Showreel",
+            showreelSubtitle: "Um vídeo para apresentar o trabalho de forma mais visual.",
+            videoPlaceholderTitle: "Seu vídeo aqui",
+            videoPlaceholderText: "Ative a edição para carregar um showreel.",
+            changeVideo: "Trocar vídeo",
+            contactTitle: "Contato",
+            contactSubtitle: "Deixe as formas de contato que deseja divulgar.",
+            phoneLabel: "Telefone",
+            discordLabel: "Discord",
+            emailLabel: "E-mail",
+            contactMessageLabel: "Mensagem",
+            edit: "Editar",
+            done: "Concluir edição",
+            editHint: "Modo de edição ativo: clique nos textos contornados para editar. Nas imagens e vídeo, use os botões que aparecem.",
+            saveError: "Não foi possível salvar as alterações.",
+            uploadImageError: "Não foi possível enviar a imagem.",
+            uploadVideoError: "Não foi possível enviar o vídeo."
+        },
+        en: {
+            navAbout: "About",
+            navProjects: "Projects",
+            navShowreel: "Showreel",
+            navContact: "Contact",
+            heroButtonProjects: "View projects",
+            heroButtonContact: "Get in touch",
+            imagePlaceholderTitle: "Your main image",
+            imagePlaceholderText: "Enable editing to place an image here.",
+            changeImage: "Change image",
+            aboutTitle: "About me",
+            aboutSubtitle: "A quick summary of the work.",
+            projectsTitle: "Projects",
+            projectsSubtitle: "Some of the work that can appear here.",
+            showreelTitle: "Showreel",
+            showreelSubtitle: "A video to present the work in a more visual way.",
+            videoPlaceholderTitle: "Your video here",
+            videoPlaceholderText: "Enable editing to upload a showreel.",
+            changeVideo: "Change video",
+            contactTitle: "Contact",
+            contactSubtitle: "Add the contact methods you want to publish.",
+            phoneLabel: "Phone",
+            discordLabel: "Discord",
+            emailLabel: "E-mail",
+            contactMessageLabel: "Message",
+            edit: "Edit",
+            done: "Finish editing",
+            editHint: "Editing mode is active: click outlined text to edit. For images and video, use the buttons that appear.",
+            saveError: "The changes could not be saved.",
+            uploadImageError: "The image could not be uploaded.",
+            uploadVideoError: "The video could not be uploaded."
+        }
+    };
+
+    const DEFAULTS = {
+        pt: {
+            brand: "Seu Nome",
+            eyebrow: "DESIGNER 3D",
+            heroTitle: "Olá, sou Seu Nome",
+            heroSubtitle: "Sou designer 3D com 4 anos de experiência.\nCrio projetos visuais com foco em qualidade, detalhe e personalidade.",
+            mainImageCaption: "Imagem principal / trabalho em destaque",
+            aboutText: "Tenho experiência criando trabalhos em 3D e gosto de transformar ideias em imagens com identidade.\n\nEste espaço pode ser usado para falar sobre experiência, estilo, ferramentas, clientes ou qualquer outra informação importante.",
+            stat1Value: "4+",
+            stat1Label: "anos de experiência",
+            stat2Value: "3D",
+            stat2Label: "área principal",
+            stat3Value: "100%",
+            stat3Label: "foco no projeto",
+            project1Title: "Projeto 01",
+            project1Description: "Descrição do projeto, objetivo e principais detalhes.",
+            project1Link: "Ver projeto",
+            project2Title: "Projeto 02",
+            project2Description: "Descrição do projeto, objetivo e principais detalhes.",
+            project2Link: "Ver projeto",
+            project3Title: "Projeto 03",
+            project3Description: "Descrição do projeto, objetivo e principais detalhes.",
+            project3Link: "Ver projeto",
+            project4Title: "Projeto 04",
+            project4Description: "Descrição do projeto, objetivo e principais detalhes.",
+            project4Link: "Ver projeto",
+            project5Title: "Projeto 05",
+            project5Description: "Descrição do projeto, objetivo e principais detalhes.",
+            project5Link: "Ver projeto",
+            project6Title: "Projeto 06",
+            project6Description: "Descrição do projeto, objetivo e principais detalhes.",
+            project6Link: "Ver projeto",
+            project7Title: "Projeto 07",
+            project7Description: "Descrição do projeto, objetivo e principais detalhes.",
+            project7Link: "Ver projeto",
+            showreelTextTitle: "Mostre seu processo.",
+            showreelText: "Use este espaço para explicar o que aparece no vídeo, apresentar uma animação, uma sequência de trabalhos ou um making of.",
+            phoneValue: "+55 (00) 00000-0000",
+            discordValue: "@seuusuario",
+            emailValue: "seuemail@exemplo.com",
+            contactMessage: "Faço cada projeto com atenção aos detalhes.",
+            footerText: "© 2026 Seu Nome — Portfólio."
+        },
+        en: {
+            brand: "Seu Nome",
+            eyebrow: "3D DESIGNER",
+            heroTitle: "Hello, I'm Seu Nome",
+            heroSubtitle: "I'm a 3D designer with 4 years of experience.\nI create visual projects focused on quality, detail and personality.",
+            mainImageCaption: "Main image / featured work",
+            aboutText: "I have experience creating 3D work and I enjoy turning ideas into visuals with identity.\n\nUse this space to talk about experience, style, tools, clients or any other important information.",
+            stat1Value: "4+",
+            stat1Label: "years of experience",
+            stat2Value: "3D",
+            stat2Label: "main area",
+            stat3Value: "100%",
+            stat3Label: "project focused",
+            project1Title: "Project 01",
+            project1Description: "Project description, goal and main details.",
+            project1Link: "View project",
+            project2Title: "Project 02",
+            project2Description: "Project description, goal and main details.",
+            project2Link: "View project",
+            project3Title: "Project 03",
+            project3Description: "Project description, goal and main details.",
+            project3Link: "View project",
+            project4Title: "Project 04",
+            project4Description: "Project description, goal and main details.",
+            project4Link: "View project",
+            project5Title: "Project 05",
+            project5Description: "Project description, goal and main details.",
+            project5Link: "View project",
+            project6Title: "Project 06",
+            project6Description: "Project description, goal and main details.",
+            project6Link: "View project",
+            project7Title: "Project 07",
+            project7Description: "Project description, goal and main details.",
+            project7Link: "View project",
+            showreelTextTitle: "Show your process.",
+            showreelText: "Use this space to explain the video, present an animation, a selection of work or a making-of.",
+            phoneValue: "+55 (00) 00000-0000",
+            discordValue: "@yourusername",
+            emailValue: "youremail@example.com",
+            contactMessage: "I build every project with attention to detail.",
+            footerText: "© 2026 Seu Nome — Portfolio."
+        }
+    };
+
+    const editableElements = document.querySelectorAll(".editable");
+    const toggleEditBtn = document.getElementById("toggleEditBtn");
+    const langEN = document.getElementById("langEN");
+    const langPT = document.getElementById("langPT");
+
+    function currentText(key) {
+        return siteData?.texts?.[currentLanguage]?.[key]
+            ?? DEFAULTS[currentLanguage]?.[key]
+            ?? "";
+    }
+
+    function renderLanguage() {
+        document.documentElement.lang = currentLanguage === "pt" ? "pt-BR" : "en";
+
+        editableElements.forEach((el) => {
+            const key = el.dataset.key;
+            // textContent is deliberate: saved data can never become HTML.
+            el.textContent = currentText(key);
+        });
+
+        document.querySelectorAll("[data-ui]").forEach((el) => {
+            const key = el.dataset.ui;
+            if (UI[currentLanguage][key]) {
+                el.textContent = UI[currentLanguage][key];
+            }
+        });
+
+        langEN.classList.toggle("active", currentLanguage === "en");
+        langPT.classList.toggle("active", currentLanguage === "pt");
+
+        if (toggleEditBtn) {
+            toggleEditBtn.textContent = editMode ? UI[currentLanguage].done : UI[currentLanguage].edit;
+        }
+    }
+
+    function collectCurrentTexts() {
+        const texts = {};
+        editableElements.forEach((el) => {
+            texts[el.dataset.key] = el.textContent;
+        });
+        return texts;
+    }
+
+    async function api(path, options = {}) {
+        const response = await fetch(path, {
+            credentials: "same-origin",
+            ...options
+        });
+
+        let payload = null;
+        try {
+            payload = await response.json();
+        } catch (_) {
+            // Empty/non-JSON response.
+        }
+
+        if (!response.ok) {
+            throw new Error(payload?.error || `HTTP ${response.status}`);
+        }
+
+        return payload;
+    }
+
+    async function loadSite() {
+        try {
+            const payload = await api("/api/site");
+            siteData = payload;
+            renderLanguage();
+            await loadAllMedia();
+        } catch (error) {
+            console.error("Não foi possível carregar o site:", error);
+            renderLanguage();
+        }
+    }
+
+    async function saveAllTextForCurrentLanguage() {
+        const textMap = collectCurrentTexts();
+
+        await api("/api/site/texts", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                language: currentLanguage,
+                texts: textMap
+            })
+        });
+
+        siteData.texts[currentLanguage] = textMap;
+    }
+
+    function enableEditing() {
+        if (!authenticated) return;
+
+        editMode = true;
+        document.body.classList.add("edit-mode");
+
+        editableElements.forEach((el) => {
+            el.contentEditable = "true";
+            el.spellcheck = true;
+        });
+
+        renderLanguage();
+    }
+
+    async function disableEditing() {
+        try {
+            await saveAllTextForCurrentLanguage();
+
+            editMode = false;
+            document.body.classList.remove("edit-mode");
+
+            editableElements.forEach((el) => {
+                el.contentEditable = "false";
+            });
+
+            renderLanguage();
+        } catch (error) {
+            console.error(error);
+            alert(UI[currentLanguage].saveError);
+        }
+    }
+
+    toggleEditBtn.addEventListener("click", async () => {
+        if (!authenticated) return;
+
+        if (editMode) {
+            await disableEditing();
+        } else {
+            enableEditing();
+        }
+    });
+
+    editableElements.forEach((el) => {
+        el.addEventListener("paste", (event) => {
+            event.preventDefault();
+
+            const text = (event.clipboardData || window.clipboardData)
+                .getData("text/plain");
+
+            // Pasting as text, never as HTML.
+            document.execCommand("insertText", false, text);
+        });
+    });
+
+    async function setLanguage(language) {
+        if (!["en", "pt"].includes(language) || language === currentLanguage) return;
+
+        if (editMode) {
+            await disableEditing();
+            if (editMode) return;
+        }
+
+        currentLanguage = language;
+        localStorage.setItem("portfolio_language", currentLanguage);
+        renderLanguage();
+    }
+
+    langEN.addEventListener("click", () => setLanguage("en"));
+    langPT.addEventListener("click", () => setLanguage("pt"));
+
+    async function uploadMedia(file, kind, slot) {
+        if (!authenticated) {
+            throw new Error("Unauthorized");
+        }
+
+        const form = new FormData();
+        form.append("file", file);
+        form.append("kind", kind);
+        form.append("slot", slot);
+
+        return api("/api/media", {
+            method: "POST",
+            body: form
+        });
+    }
+
+    function setupImageInput(inputId, imageId, emptyId, slot) {
+        const input = document.getElementById(inputId);
+        const image = document.getElementById(imageId);
+        const empty = document.getElementById(emptyId);
+
+        input.addEventListener("change", async () => {
+            const file = input.files[0];
+            if (!file || !authenticated) return;
+
+            try {
+                const result = await uploadMedia(file, "image", slot);
+                renderImage(imageId, emptyId, result.url);
+            } catch (error) {
+                console.error(error);
+                alert(UI[currentLanguage].uploadImageError);
+            } finally {
+                input.value = "";
+            }
+        });
+    }
+
+    function setupVideoInput() {
+        const input = document.getElementById("videoInput");
+        const video = document.getElementById("showreelVideo");
+        const empty = document.getElementById("videoEmpty");
+
+        input.addEventListener("change", async () => {
+            const file = input.files[0];
+            if (!file || !authenticated) return;
+
+            try {
+                const result = await uploadMedia(file, "video", "showreelVideo");
+                renderVideo(result.url);
+            } catch (error) {
+                console.error(error);
+                alert(UI[currentLanguage].uploadVideoError);
+            } finally {
+                input.value = "";
+            }
+        });
+    }
+
+    function renderImage(imageId, emptyId, url) {
+        const image = document.getElementById(imageId);
+        const empty = document.getElementById(emptyId);
+
+        if (url) {
+            image.src = url;
+            image.style.display = "block";
+            empty.style.display = "none";
+        } else {
+            image.removeAttribute("src");
+            image.style.display = "none";
+            empty.style.display = "grid";
+        }
+    }
+
+    function renderVideo(url) {
+        const video = document.getElementById("showreelVideo");
+        const empty = document.getElementById("videoEmpty");
+
+        if (url) {
+            video.src = url;
+            video.style.display = "block";
+            empty.style.display = "none";
+        } else {
+            video.removeAttribute("src");
+            video.style.display = "none";
+            empty.style.display = "block";
+        }
+    }
+
+    async function loadAllMedia() {
+        renderImage("mainImage", "mainImageEmpty", siteData?.media?.mainImage);
+        renderImage("projectImage1", "projectEmpty1", siteData?.media?.projectImage1);
+        renderImage("projectImage2", "projectEmpty2", siteData?.media?.projectImage2);
+        renderImage("projectImage3", "projectEmpty3", siteData?.media?.projectImage3);
+        renderImage("projectImage4", "projectEmpty4", siteData?.media?.projectImage4);
+        renderImage("projectImage5", "projectEmpty5", siteData?.media?.projectImage5);
+        renderImage("projectImage6", "projectEmpty6", siteData?.media?.projectImage6);
+        renderImage("projectImage7", "projectEmpty7", siteData?.media?.projectImage7);
+        renderVideo(siteData?.media?.showreelVideo);
+    }
+
+    setupImageInput("mainImageInput", "mainImage", "mainImageEmpty", "mainImage");
+    setupImageInput("projectInput1", "projectImage1", "projectEmpty1", "projectImage1");
+    setupImageInput("projectInput2", "projectImage2", "projectEmpty2", "projectImage2");
+    setupImageInput("projectInput3", "projectImage3", "projectEmpty3", "projectImage3");
+    setupImageInput("projectInput4", "projectImage4", "projectEmpty4", "projectImage4");
+    setupImageInput("projectInput5", "projectImage5", "projectEmpty5", "projectImage5");
+    setupImageInput("projectInput6", "projectImage6", "projectEmpty6", "projectImage6");
+    setupImageInput("projectInput7", "projectImage7", "projectEmpty7", "projectImage7");
+    setupVideoInput();
+
+    /* Carrossel atual: mantido e apenas impede a navegação durante a edição. */
+    const track = document.getElementById("projectTrack");
+    const btnPrev = document.querySelector(".carousel-arrow.prev");
+    const btnNext = document.querySelector(".carousel-arrow.next");
+
+    if (btnNext && btnPrev && track) {
+        btnNext.addEventListener("click", () => {
+            const maxScroll = track.scrollWidth - track.clientWidth;
+
+            if (track.scrollLeft >= maxScroll - 10) {
+                track.scrollTo({ left: 0, behavior: "smooth" });
+            } else {
+                track.scrollBy({ left: track.clientWidth / 2, behavior: "smooth" });
+            }
+        });
+
+        btnPrev.addEventListener("click", () => {
+            if (track.scrollLeft <= 10) {
+                track.scrollTo({ left: track.scrollWidth, behavior: "smooth" });
+            } else {
+                track.scrollBy({ left: -track.clientWidth / 2, behavior: "smooth" });
+            }
+        });
+    }
+
+    function connectLiveUpdates() {
+        if (!window.EventSource) return;
+
+        const events = new EventSource("/api/events");
+
+        events.addEventListener("site-updated", async () => {
+            if (!editMode) {
+                await loadSite();
+            }
+        });
+    }
+
+    async function init() {
+        try {
+            const auth = await api("/api/auth/me");
+            authenticated = auth.authenticated === true;
+
+            if (authenticated) {
+                document.body.classList.add("admin-authenticated");
+            }
+        } catch (_) {
+            authenticated = false;
+        }
+
+        renderLanguage();
+        await loadSite();
+        connectLiveUpdates();
+    }
+
+    init();
+</script>
+</body>
+</html>
