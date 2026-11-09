@@ -1,0 +1,2948 @@
+# -*- coding: utf-8 -*-
+"""Hunter Cat — automatizador visual em um único arquivo (motor + interface café)."""
+from __future__ import annotations
+import ctypes
+import sys
+
+# DPI awareness ocorre antes de importar bibliotecas de captura, visão e interface.
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+import json
+import math
+import random
+import re
+import threading
+import time
+import uuid
+import queue
+import tkinter as tk
+from collections.abc import Callable
+from copy import deepcopy
+from ctypes import wintypes
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from tkinter import font as tkfont
+from types import SimpleNamespace
+from typing import Any
+import cv2
+import customtkinter as ctk
+import mss
+import numpy as np
+import pyautogui
+from PIL import Image
+
+_PADRAO_SEGREDO = re.compile(r"\{\{segredo:([\w.-]{1,80})\}\}")
+
+# ==================== motor/modelos.py ====================
+
+@dataclass
+class Alvo:
+    id: str
+    nome: str
+    arquivo: str
+    ordem: int = 0
+    in_queue: bool = True
+    acao: str = "clique"
+    texto: str = ""
+    delay_ms: int = 450
+    confianca: float = 0.85
+    tentativas: int = 5
+    intervalo_tentativa_ms: int = 400
+    monitor_origem: int = 0
+    digitar_humano: bool = False
+    scroll_pixels: int = 500
+    tecla: str = "enter"
+    arquivos: list[str] = field(default_factory=list)
+    sensivel: bool = False
+    destinos_permitidos: list[str] = field(default_factory=list)
+
+    @classmethod
+    def de_dict(cls, dados: dict[str, Any]) -> "Alvo":
+        campos = cls.__dataclass_fields__
+        valores = {k: v for k, v in dados.items() if k in campos}
+        if not valores.get("arquivos") and valores.get("arquivo"):
+            valores["arquivos"] = [valores["arquivo"]]
+        return cls(**valores)
+
+    def para_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Perfil:
+    nome: str
+    alvos: list[Alvo] = field(default_factory=list)
+    modo: str = "simples"
+    ciclos: int = 1
+
+    @classmethod
+    def de_dict(cls, dados: dict[str, Any]) -> "Perfil":
+        return cls(
+            nome=str(dados.get("nome", "perfil")),
+            alvos=[Alvo.de_dict(a) for a in dados.get("alvos", [])],
+            modo=str(dados.get("modo", "simples")),
+            ciclos=max(1, int(dados.get("ciclos", 1))),
+        )
+
+    def para_dict(self) -> dict[str, Any]:
+        return {
+            "nome": self.nome,
+            "alvos": [a.para_dict() for a in self.alvos],
+            "modo": self.modo,
+            "ciclos": self.ciclos,
+        }
+
+
+# ==================== motor/captura.py ====================
+
+_PIL_RESAMPLING = getattr(Image, "Resampling", Image)
+_PIL_LANCZOS = getattr(_PIL_RESAMPLING, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
+
+
+def diretorio_alvos(raiz: Path, perfil: str) -> Path:
+    pasta = raiz / "alvos" / perfil
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def salvar_alvo(
+    imagem: Image.Image,
+    raiz: Path,
+    perfil: str,
+    monitor_origem: int,
+    ordem: int,
+    nome: str | None = None,
+) -> Alvo:
+    """Salva cada recorte como PNG e mantém sua configuração num JSON irmão."""
+    alvo_id = uuid.uuid4().hex
+    pasta = diretorio_alvos(raiz, perfil)
+    caminho_png = pasta / f"{alvo_id}.png"
+    caminho_json = pasta / f"{alvo_id}.json"
+    imagem.convert("RGB").save(caminho_png, format="PNG", optimize=True)
+    alvo = Alvo(
+        id=alvo_id,
+        nome=nome or f"alvo_{ordem:02d}",
+        arquivo=str(caminho_png.relative_to(raiz)),
+        ordem=ordem,
+        monitor_origem=monitor_origem,
+        arquivos=[str(caminho_png.relative_to(raiz))],
+    )
+    salvar_metadados(alvo, caminho_json)
+    return alvo
+
+
+def salvar_metadados(alvo: Alvo, caminho: Path) -> None:
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    temporario = caminho.with_suffix(".json.tmp")
+    temporario.write_text(
+        json.dumps(alvo.para_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporario.replace(caminho)
+
+
+def caminho_metadados(raiz: Path, alvo: Alvo) -> Path:
+    return (raiz / alvo.arquivo).with_suffix(".json")
+
+
+def carregar_metadados(raiz: Path, arquivo_png: str) -> Alvo | None:
+    caminho_png = raiz / arquivo_png
+    caminho_json = caminho_png.with_suffix(".json")
+    if not caminho_json.exists():
+        return None
+    try:
+        return Alvo.de_dict(json.loads(caminho_json.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def carregar_preview(raiz: Path, alvo: Alvo, limite: tuple[int, int] = (260, 185)) -> Image.Image | None:
+    caminho = raiz / alvo.arquivo
+    if not caminho.is_file():
+        return None
+    try:
+        imagem = Image.open(caminho).convert("RGB")
+        imagem.thumbnail(limite, _PIL_LANCZOS)
+        return imagem.copy()
+    except OSError:
+        return None
+
+
+# ==================== motor/perfis.py ====================
+
+def nome_seguro(nome: str) -> str:
+    limpo = re.sub(r"[^\w.-]+", "_", nome.strip(), flags=re.UNICODE).strip("._")
+    if not limpo or limpo in {".", ".."}:
+        raise ValueError("Dê ao perfil um nome com letras ou números.")
+    return limpo[:64]
+
+
+class RepositorioPerfis:
+    def __init__(self, raiz: Path):
+        self.raiz = raiz
+        self.pasta = raiz / "perfis"
+        self.avisos: list[str] = []
+        self.pasta.mkdir(parents=True, exist_ok=True)
+        (raiz / "alvos").mkdir(parents=True, exist_ok=True)
+
+    def listar(self) -> list[str]:
+        return sorted(p.stem for p in self.pasta.glob("*.json") if p.is_file())
+
+    def _validar_caminho_alvo(self, perfil: str, arquivo: str) -> Path:
+        if not isinstance(arquivo, str):
+            raise ValueError("O caminho do alvo precisa ser texto.")
+        raiz = self.raiz.resolve()
+        pasta_perfil = (raiz / "alvos" / perfil).resolve()
+        caminho = (raiz / arquivo).resolve()
+        caminho.relative_to(raiz)
+        if caminho.parent != pasta_perfil or caminho.suffix.lower() != ".png":
+            raise ValueError(f"Arquivo de alvo fora da pasta do perfil: {arquivo}")
+        return caminho
+
+    def carregar(self, nome: str) -> Perfil:
+        seguro = nome_seguro(nome)
+        caminho = self.pasta / f"{seguro}.json"
+        if not caminho.exists():
+            return Perfil(nome=seguro)
+        try:
+            dados = json.loads(caminho.read_text(encoding="utf-8"))
+            perfil = Perfil.de_dict(dados)
+            perfil.nome = seguro
+            alvos_validos: list[Alvo] = []
+            for alvo in perfil.alvos:
+                try:
+                    self._validar_caminho_alvo(seguro, alvo.arquivo)
+                    refs = alvo.arquivos or [alvo.arquivo]
+                    alvo.arquivos = [str(self._validar_caminho_alvo(seguro, item).relative_to(self.raiz.resolve()))
+                                     for item in refs]
+                    alvos_validos.append(alvo)
+                except (OSError, TypeError, ValueError):
+                    self.avisos.append(f"caminho inválido ignorado no perfil {seguro}: {alvo.arquivo}")
+            perfil.alvos = alvos_validos
+            return perfil
+        except (OSError, ValueError, TypeError) as erro:
+            recuperados: list[Alvo] = []
+            pasta_alvos = (self.raiz / "alvos" / seguro).resolve()
+            for arquivo_json in sorted(pasta_alvos.glob("*.json")):
+                try:
+                    alvo = Alvo.de_dict(json.loads(arquivo_json.read_text(encoding="utf-8")))
+                    caminho_png = (self.raiz / alvo.arquivo).resolve()
+                    caminho_png.relative_to(self.raiz.resolve())
+                    if (alvo.in_queue and caminho_png.parent == pasta_alvos and caminho_png.suffix.lower() == ".png"
+                            and caminho_png.is_file() and alvo.id == arquivo_json.stem):
+                        recuperados.append(alvo)
+                except (OSError, ValueError, TypeError):
+                    continue
+            recuperados.sort(key=lambda alvo: (alvo.ordem, alvo.id))
+            if recuperados:
+                perfil = Perfil(nome=seguro, alvos=recuperados)
+                self.salvar(perfil)
+                self.avisos.append(
+                    f"perfil {seguro} estava corrompido; fila recuperada de {len(recuperados)} JSON(s) de alvo"
+                )
+                return perfil
+            self.avisos.append(
+                f"perfil {seguro} não pôde ser lido ({erro}); nenhum alvo foi recuperado"
+            )
+            return Perfil(nome=seguro)
+
+    def salvar(self, perfil: Perfil) -> None:
+        seguro = nome_seguro(perfil.nome)
+        perfil.nome = seguro
+        for ordem, alvo in enumerate(perfil.alvos, start=1):
+            self._validar_caminho_alvo(seguro, alvo.arquivo)
+            refs = alvo.arquivos or [alvo.arquivo]
+            alvo.arquivos = [str(self._validar_caminho_alvo(seguro, item).relative_to(self.raiz.resolve()))
+                             for item in refs]
+            alvo.ordem = ordem
+            alvo.in_queue = True
+            salvar_metadados(alvo, caminho_metadados(self.raiz, alvo))
+        caminho = self.pasta / f"{seguro}.json"
+        temporario = caminho.with_suffix(".json.tmp")
+        temporario.write_text(
+            json.dumps(perfil.para_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporario.replace(caminho)
+
+
+# ==================== motor/visao.py ====================
+
+@dataclass
+class Correspondencia:
+    x: int
+    y: int
+    largura: int
+    altura: int
+    confianca: float
+    monitor: int
+    metodo: str = "template-cor"
+    escala: float = 1.0
+    angulo: float | None = None
+
+    @property
+    def centro(self) -> tuple[int, int]:
+        return self.x + self.largura // 2, self.y + self.altura // 2
+
+
+def carregar_template(caminho: Path) -> np.ndarray:
+    imagem = cv2.imread(str(caminho), cv2.IMREAD_COLOR)
+    if imagem is None or imagem.size == 0:
+        raise ValueError(f"Não foi possível abrir o alvo: {caminho}")
+    return imagem
+
+
+def _capturar_monitores(monitor_origem: int, restringir_monitor: bool) -> list[tuple[int, dict, np.ndarray]]:
+    """Captura uma vez cada monitor usado nesta busca."""
+    capturas: list[tuple[int, dict, np.ndarray]] = []
+    with mss.MSS() as capturador:
+        monitores = capturador.monitors[1:]
+        if not monitores:
+            return capturas
+        if restringir_monitor and 1 <= monitor_origem <= len(monitores):
+            candidatos = [(monitor_origem, monitores[monitor_origem - 1])]
+        else:
+            candidatos = list(enumerate(monitores, start=1))
+        for indice, monitor in candidatos:
+            bgra = np.asarray(capturador.grab(monitor))
+            capturas.append((indice, monitor, cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)))
+    return capturas
+
+
+def _score_cor_dominante(template: np.ndarray, frame: np.ndarray, indice: int,
+                         monitor: dict) -> Correspondencia | None:
+    """Compara componentes de cor em Lab para templates quase uniformes."""
+    altura_t, largura_t = template.shape[:2]
+    pixels = template.reshape(-1, 3).astype(np.float32)
+    cor_media = np.median(pixels, axis=0)
+    distancia = np.linalg.norm(pixels - cor_media, axis=1)
+    if float(np.percentile(distancia, 90)) > 24.0:
+        return None
+    template_lab = cv2.cvtColor(np.uint8([[cor_media]]), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    frame_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+    delta = np.linalg.norm(frame_lab - template_lab, axis=2)
+    tolerancia = max(12.0, min(28.0, float(np.percentile(distancia, 90)) + 14.0))
+    mascara = np.uint8(delta <= tolerancia)
+    n, rotulos, estatisticas, centros = cv2.connectedComponentsWithStats(mascara, connectivity=8)
+    area_t = max(1, largura_t * altura_t)
+    melhor: Correspondencia | None = None
+    proporcao_t = largura_t / max(1, altura_t)
+    for i in range(1, n):
+        x, y, largura, altura, area = map(int, estatisticas[i])
+        if area < area_t * 0.20 or area > area_t * 4.2:
+            continue
+        proporcao = largura / max(1, altura)
+        erro_prop = abs(np.log(max(0.01, proporcao / proporcao_t)))
+        if erro_prop > 0.75:
+            continue
+        escala = np.sqrt(max(1, area) / area_t)
+        escala = min(2.0, max(0.5, escala))
+        roi = frame[y:y + altura, x:x + largura]
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+        cor_local = np.median(lab.reshape(-1, 3), axis=0)
+        erro_cor = float(np.linalg.norm(cor_local - template_lab))
+        similaridade_cor = max(0.0, 1.0 - erro_cor / (tolerancia * 1.75))
+        similaridade_forma = max(0.0, 1.0 - erro_prop / 0.75)
+        similaridade_tamanho = max(0.0, 1.0 - abs(np.log(max(0.01, escala))) / np.log(2.0))
+        score = 0.62 * similaridade_cor + 0.23 * similaridade_forma + 0.15 * similaridade_tamanho
+        candidato = Correspondencia(
+            int(monitor["left"] + x), int(monitor["top"] + y), largura, altura,
+            float(min(0.99, score)), indice, metodo="cor-dominante", escala=float(escala),
+        )
+        if melhor is None or candidato.confianca > melhor.confianca:
+            melhor = candidato
+    return melhor
+
+
+def _candidatos_template(template: np.ndarray, frame: np.ndarray, indice: int,
+                         monitor: dict) -> Correspondencia | None:
+    melhor: Correspondencia | None = None
+    altura_original, largura_original = template.shape[:2]
+    for escala in (0.50, 0.60, 0.70, 0.80, 0.90, 1.0, 1.10, 1.20, 1.35, 1.50, 1.70, 2.0):
+        largura_t = max(1, round(largura_original * escala))
+        altura_t = max(1, round(altura_original * escala))
+        if altura_t > frame.shape[0] or largura_t > frame.shape[1]:
+            continue
+        if largura_t == largura_original and altura_t == altura_original:
+            temp = template
+        else:
+            interp = cv2.INTER_AREA if escala < 1 else cv2.INTER_CUBIC
+            temp = cv2.resize(template, (largura_t, altura_t), interpolation=interp)
+        variancia = float(np.mean(np.var(temp.astype(np.float32), axis=(0, 1))))
+        if variancia < 4.0:
+            resultado = cv2.matchTemplate(frame, temp, cv2.TM_SQDIFF_NORMED)
+            minimo, _, local, _ = cv2.minMaxLoc(resultado)
+            score = max(0.0, min(1.0, 1.0 - float(minimo)))
+            metodo = "sqdiff-cor"
+        else:
+            resultado = cv2.matchTemplate(frame, temp, cv2.TM_CCORR_NORMED)
+            _, valor, _, local = cv2.minMaxLoc(resultado)
+            score = float(max(0.0, min(1.0, valor)))
+            metodo = "template-cor"
+        candidato = Correspondencia(
+            int(monitor["left"] + local[0]), int(monitor["top"] + local[1]),
+            largura_t, altura_t, score, indice, metodo=metodo, escala=float(escala),
+        )
+        if melhor is None or candidato.confianca > melhor.confianca:
+            melhor = candidato
+    return melhor
+
+
+def buscar_melhor_uma_vez(
+    template: np.ndarray,
+    monitor_origem: int = 0,
+    restringir_monitor: bool = False,
+ ) -> Correspondencia | None:
+    melhor: Correspondencia | None = None
+    for indice, monitor, frame in _capturar_monitores(monitor_origem, restringir_monitor):
+        flat = _score_cor_dominante(template, frame, indice, monitor)
+        texturizado = _candidatos_template(template, frame, indice, monitor)
+        for candidato in (flat, texturizado):
+            if candidato is not None and (melhor is None or candidato.confianca > melhor.confianca):
+                melhor = candidato
+    return melhor
+
+
+def buscar_uma_vez(
+    template: np.ndarray,
+    confianca_minima: float,
+    monitor_origem: int = 0,
+    restringir_monitor: bool = False,
+) -> Correspondencia | None:
+    melhor = buscar_melhor_uma_vez(template, monitor_origem, restringir_monitor)
+    return melhor if melhor and melhor.confianca >= confianca_minima else None
+
+
+def localizar(
+    caminho: Path,
+    confianca_minima: float = 0.85,
+    tentativas: int = 5,
+    intervalo_ms: int = 400,
+    monitor_origem: int = 0,
+    restringir_monitor: bool = False,
+    cancelado: Callable[[], bool] | None = None,
+    ao_tentar: Callable[[int, float | None], None] | None = None,
+) -> Correspondencia | None:
+    """Repete a busca sem bloquear a UI; cada tentativa pode ser cancelada."""
+    template = carregar_template(caminho)
+    total = max(1, tentativas)
+    for tentativa in range(1, total + 1):
+        if cancelado and cancelado():
+            return None
+        melhor = buscar_melhor_uma_vez(template, monitor_origem, restringir_monitor)
+        achado = melhor if melhor and melhor.confianca >= confianca_minima else None
+        if ao_tentar:
+            ao_tentar(tentativa, melhor.confianca if melhor else None)
+        if achado:
+            return achado
+        if tentativa < total:
+            fim = time.monotonic() + max(0, intervalo_ms) / 1000
+            while time.monotonic() < fim:
+                if cancelado and cancelado():
+                    return None
+                time.sleep(min(0.05, max(0, fim - time.monotonic())))
+    return None
+
+
+# ==================== motor/acoes.py ====================
+
+def guardar_segredo(nome: str, valor: str) -> None:
+    """Guarda no Credential Manager do Windows; recusa backend em texto puro."""
+    if sys.platform != "win32":
+        raise RuntimeError("O cofre integrado requer Windows Credential Manager.")
+    try:
+        import keyring
+    except ImportError as erro:
+        raise RuntimeError("Instale keyring para usar o cofre de credenciais.") from erro
+    backend = keyring.get_keyring()
+    if "winvault" not in backend.__class__.__name__.casefold():
+        raise RuntimeError("O backend seguro do Windows Credential Manager não está ativo.")
+    keyring.set_password("Cerbero", nome, valor)
+
+
+def obter_segredo(nome: str) -> str:
+    if sys.platform != "win32":
+        raise RuntimeError("O cofre integrado requer Windows Credential Manager.")
+    try:
+        import keyring
+    except ImportError as erro:
+        raise RuntimeError("Instale keyring para usar o cofre de credenciais.") from erro
+    backend = keyring.get_keyring()
+    if "winvault" not in backend.__class__.__name__.casefold():
+        raise RuntimeError("O backend seguro do Windows Credential Manager não está ativo.")
+    valor = keyring.get_password("Cerbero", nome)
+    if valor is None:
+        raise KeyError(f"segredo ausente no cofre: {nome}")
+    return valor
+
+
+def validar_destino_segredo(destinos: list[str]) -> tuple[bool, str]:
+    """Só libera segredo quando o título ativo contém destino autorizado."""
+    permitidos = [item.strip().casefold() for item in destinos if item.strip()]
+    if not permitidos:
+        return False, "configure ao menos um título/domínio permitido para o passo sensível"
+    try:
+        import pygetwindow
+        titulo = (pygetwindow.getActiveWindowTitle() or "").casefold()
+    except Exception:
+        return False, "não foi possível verificar a janela ativa; segredo bloqueado"
+    if not titulo:
+        return False, "janela ativa sem título verificável; segredo bloqueado"
+    if not any(destino in titulo for destino in permitidos):
+        return False, "janela ativa não corresponde aos destinos permitidos; segredo bloqueado"
+    return True, titulo
+
+
+ACOES = ("clique", "clique_duplo", "clique_direito", "digitar", "tecla", "scroll", "esperar", "pausar_ate_encontrar")
+ROTULOS_ACAO = {"clique":"Clique","clique_duplo":"Clique duplo","clique_direito":"Clique com botão direito","digitar":"Digitar","tecla":"Pressionar tecla","scroll":"Rolar tela","esperar":"Esperar","pausar_ate_encontrar":"Aguardar até localizar"}
+CODIGOS_ACAO = {rotulo: codigo for codigo, rotulo in ROTULOS_ACAO.items()}
+
+
+def executar_acao(acao, posicao, texto, tecla, scroll_pixels, digitar_humano):
+    controle = pyautogui
+    if acao in {"clique", "clique_duplo", "clique_direito"}:
+        if posicao is None:
+            raise ValueError("A ação de mouse precisa de um alvo localizado.")
+        controle.moveTo(*posicao, duration=0)
+        if acao == "clique":
+            controle.click()
+        elif acao == "clique_duplo":
+            controle.doubleClick()
+        else:
+            controle.rightClick()
+    elif acao == "digitar":
+        if posicao is None:
+            raise ValueError("A ação de digitar precisa de um campo localizado.")
+        controle.click(*posicao)
+        time.sleep(0.08)
+        if digitar_humano:
+            for indice, caractere in enumerate(texto):
+                controle.write(caractere)
+                if indice < len(texto) - 1:
+                    time.sleep(random.uniform(0.04, 0.12))
+        else:
+            controle.write(texto)
+    elif acao == "tecla":
+        teclas = [parte.strip() for parte in tecla.lower().replace("+", " ").split() if parte.strip()]
+        if not teclas:
+            raise ValueError("Informe uma tecla ou combinação, como ctrl+s.")
+        controle.press(teclas[0]) if len(teclas) == 1 else controle.hotkey(*teclas)
+    elif acao == "scroll":
+        if posicao is None:
+            raise ValueError("A ação de rolar a tela precisa de um alvo localizado.")
+        controle.moveTo(*posicao, duration=0)
+        controle.scroll(round(int(scroll_pixels) / 40))
+    elif acao not in {"esperar", "pausar_ate_encontrar"}:
+        raise ValueError(f"Ação desconhecida: {acao}")
+    return False
+
+
+# ==================== motor/executor.py ====================
+
+class Executor:
+    def __init__(
+        self,
+        raiz: Path,
+        eventos: queue.Queue,
+        restringir_monitor: bool = False,
+    ):
+        self.raiz = raiz
+        self.eventos = eventos
+        self.restringir_monitor = restringir_monitor
+        self.parar_evento = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.inicio: float | None = None
+        self.ciclo = 0
+        self._listener = None
+
+    @property
+    def ativo(self) -> bool:
+        return bool(self.thread and self.thread.is_alive())
+
+    def iniciar(self, perfil: Perfil, modo: str, ciclos: int) -> bool:
+        if self.ativo:
+            return False
+        if not perfil.alvos:
+            self.eventos.put(("log", "erro", "fila vazia; adicione um alvo antes de executar"))
+            return False
+        self.parar_evento.clear()
+        self.ciclo = 0
+        self.thread = threading.Thread(
+            target=self._rodar, args=(perfil, modo, max(1, ciclos)),
+            name="cerbero-executor", daemon=True,
+        )
+        self.thread.start()
+        return True
+
+    def parar(self, motivo: str = "parada solicitada") -> None:
+        if self.ativo:
+            self.eventos.put(("log", "info", motivo))
+            self.parar_evento.set()
+
+    def _registrar_hotkey(self) -> None:
+        try:
+            from pynput import keyboard
+
+            def ao_pressionar(tecla):
+                if tecla in (keyboard.Key.esc, keyboard.Key.f12):
+                    self.parar("botão de pânico acionado")
+
+            self._listener = keyboard.Listener(on_press=ao_pressionar)
+            self._listener.daemon = True
+            self._listener.start()
+            return
+        except Exception:
+            self._listener = None
+        try:
+            import keyboard
+
+            keyboard.add_hotkey("esc", lambda: self.parar("botão de pânico acionado"))
+            keyboard.add_hotkey("f12", lambda: self.parar("botão de pânico acionado"))
+            self._listener = "keyboard"
+        except Exception as erro:
+            self.eventos.put(("log", "erro", f"hotkey global indisponível: {erro}"))
+
+    def _remover_hotkey(self) -> None:
+        if self._listener == "keyboard":
+            try:
+                import keyboard
+
+                keyboard.unhook_all_hotkeys()
+            except Exception:
+                pass
+        elif self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+        self._listener = None
+
+    def _log(self, nivel: str, mensagem: str) -> None:
+        self.eventos.put(("log", nivel, mensagem))
+
+    def _localizar(self, alvo, infinito: bool = False) -> Correspondencia | None:
+        caminho = self.raiz / alvo.arquivo
+        if not caminho.is_file():
+            self._log("erro", f"alvo ausente: {alvo.nome}")
+            return None
+        melhor_score: float | None = None
+        while not self.parar_evento.is_set():
+            def registrar_tentativa(numero: int, confianca: float | None) -> None:
+                nonlocal melhor_score
+                if confianca is not None:
+                    melhor_score = confianca if melhor_score is None else max(melhor_score, confianca)
+                total = max(1, int(alvo.tentativas))
+                if not infinito and (confianca is None or confianca < float(alvo.confianca)) and numero < total:
+                    score = "n/d" if confianca is None else f"{confianca:.2f}"
+                    self._log("info", f"alvo {alvo.nome} abaixo da precisão mínima · melhor resultado {score} · tentando novamente ({numero}/{total})")
+
+            resultado = localizar(
+                caminho,
+                confianca_minima=float(alvo.confianca),
+                tentativas=1 if infinito else int(alvo.tentativas),
+                intervalo_ms=int(alvo.intervalo_tentativa_ms),
+                monitor_origem=int(alvo.monitor_origem),
+                restringir_monitor=self.restringir_monitor,
+                cancelado=self.parar_evento.is_set,
+                ao_tentar=registrar_tentativa,
+            )
+            if resultado:
+                return resultado
+            if not infinito or self.parar_evento.is_set():
+                if not self.parar_evento.is_set():
+                    score = "n/d" if melhor_score is None else f"{melhor_score:.2f}"
+                    self._log("erro", f"alvo {alvo.nome} não localizado · melhor precisão {score} · mínimo {float(alvo.confianca):.2f}")
+                return None
+            self.eventos.put(("status", "aguardando", self.ciclo, self.inicio))
+            self.parar_evento.wait(max(0, int(alvo.intervalo_tentativa_ms)) / 1000)
+        return None
+
+    def _esperar_cooperativo(self, milissegundos: int) -> None:
+        self.parar_evento.wait(max(0, milissegundos) / 1000)
+
+    def _executar_alvo(self, alvo, indice: int) -> None:
+        if self.parar_evento.is_set():
+            return
+        estado_inicial = "aguardando" if alvo.acao == "esperar" else "vendo"
+        self.eventos.put(("status", estado_inicial, self.ciclo, self.inicio))
+        posicao: tuple[int, int] | None = None
+        correspondencia = None
+        if alvo.acao == "pausar_ate_encontrar":
+            self._log("info", f"aguardando alvo {indice:02d}: {alvo.nome}")
+            correspondencia = self._localizar(alvo, infinito=True)
+        elif alvo.acao not in {"esperar"}:
+            self._log("info", f"buscando alvo {indice:02d}: {alvo.nome}")
+            correspondencia = self._localizar(alvo)
+            if correspondencia is None:
+                if not self.parar_evento.is_set():
+                    self._log("erro", f"alvo {indice:02d} não localizado; seguindo para o próximo")
+                return
+            posicao = correspondencia.centro
+            self._log(
+                "ok",
+                f"alvo {indice:02d} localizado em ({posicao[0]}, {posicao[1]}) · "
+                f"confiança {correspondencia.confianca:.2f}",
+            )
+        if self.parar_evento.is_set():
+            return
+        if alvo.acao != "esperar":
+            self.eventos.put(("status", "agindo", self.ciclo, self.inicio))
+        texto_exec = alvo.texto
+        try:
+            if alvo.acao == "esperar":
+                self._log("info", f"esperando {alvo.delay_ms} ms")
+                self._esperar_cooperativo(alvo.delay_ms)
+            elif alvo.acao == "pausar_ate_encontrar":
+                if correspondencia:
+                    self._log("ok", f"alvo {indice:02d} encontrado; fila liberada")
+                else:
+                    return
+            else:
+                if alvo.acao == "digitar":
+                    referencia = _PADRAO_SEGREDO.fullmatch(texto_exec.strip())
+                    if alvo.sensivel or referencia:
+                        if not referencia:
+                            self._log("erro", f"passo sensível {alvo.nome} bloqueado: o perfil não contém uma referência ao cofre")
+                            return
+                        liberado, motivo = validar_destino_segredo(alvo.destinos_permitidos)
+                        if not liberado:
+                            self._log("erro", f"segredo bloqueado em {alvo.nome}: {motivo}")
+                            return
+                        try:
+                            texto_exec = obter_segredo(referencia.group(1))
+                        except (KeyError, RuntimeError) as erro:
+                            self._log("erro", f"segredo indisponível em {alvo.nome}: {erro}")
+                            return
+                executar_acao(
+                    alvo.acao, posicao, texto_exec, alvo.tecla,
+                    alvo.scroll_pixels, alvo.digitar_humano,
+                )
+                self._log("ok", f"{ROTULOS_ACAO.get(alvo.acao, alvo.acao)} concluído · {alvo.nome}")
+        except Exception as erro:
+            if erro.__class__.__name__ == "FailSafeException":
+                self.parar_evento.set()
+                self._log("erro", "proteção do mouse acionada; execução interrompida")
+            else:
+                self._log("erro", f"falha em {alvo.nome}: {erro}")
+        if alvo.acao != "esperar":
+            self._esperar_cooperativo(alvo.delay_ms)
+
+    def _rodar(self, perfil: Perfil, modo: str, ciclos: int) -> None:
+        self.inicio = time.monotonic()
+        self._registrar_hotkey()
+        self.eventos.put(("status", "vendo", self.ciclo, self.inicio))
+        self._log("info", f"execução iniciada · perfil {perfil.nome} · ESC/F12 para parar")
+        volta = 0
+        try:
+            while not self.parar_evento.is_set():
+                volta += 1
+                self.ciclo = volta
+                self.eventos.put(("status", "vendo", self.ciclo, self.inicio))
+                for indice, alvo in enumerate(perfil.alvos, start=1):
+                    if self.parar_evento.is_set():
+                        break
+                    self._executar_alvo(alvo, indice)
+                if modo == "simples" or (modo == "ciclos" and volta >= ciclos):
+                    break
+        except Exception as erro:
+            self._log("erro", f"execução interrompida: {erro}")
+        finally:
+            self._remover_hotkey()
+            estado_final = "parado" if self.parar_evento.is_set() else "ocioso"
+            self.eventos.put(("status", estado_final, self.ciclo, self.inicio))
+            self._log("info", "execução encerrada")
+
+
+# ==================== ui/tema.py ====================
+import math
+import zlib
+
+import numpy as np
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
+
+
+class T:
+    """Tema 'cafeteria': madeira escura, leite vaporizado e caramelo."""
+    ESPRESSO = "#241915"
+    PAREDE_ALTA = "#2E211C"
+    PAREDE_BASE = "#35271F"
+    PAINEL = "#42322A"
+    CARTAO = "#4E3C32"
+    CARTAO_HOVER = "#5B473B"
+    BORDA = "#65503F"
+    CAMPO = "#2D211B"
+    TEXTO = "#F6EBDC"
+    SUAVE = "#D2BBA3"
+    APAGADO = "#B39B85"
+    CARAMELO = "#E3A862"
+    CARAMELO_ESC = "#C98B45"
+    CREME = "#FFF4E2"
+    SALVIA = "#A9CFA0"
+    TERRACOTA = "#EE8F7F"
+    TERRACOTA_ESC = "#C4604F"
+    MADEIRA_CLARA = "#9A6B47"
+    MADEIRA = "#7E5438"
+    MADEIRA_FRENTE = "#5B3B27"
+    FONTE_TITULO = "Georgia"
+    FONTE_CORPO = "Segoe UI"
+    FONTE_FALLBACKS = ("Calibri", "Helvetica", "DejaVu Sans", "Arial")
+
+
+def _rgb(h):
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _c(h, a=255):
+    return _rgb(h) + (a,)
+
+
+# ==================== ui/arte.py ====================
+SS = 3                    # supersampling: desenha 3x maior e reduz (bordas lisas)
+LARG, ALT = 360, 220      # área do sprite do gato, em "unidades"
+CHAO = 206.0
+RAIO_PATA = 7.5
+NW = 20                   # quadros por ciclo de caminhada
+DC = 100.0                # distância percorrida por ciclo (unidades)
+NR = 30                   # quadros do loop do rosnado
+FPS_CLIP = 25
+
+C_CONTORNO = _c("#2B1810")
+C_PELO = _c("#E39A52")
+C_PELO_ESC = _c("#B9672B")
+C_PELO_LONGE = _c("#B87B40")
+C_PONTA = _c("#7A431F")
+C_CREME = _c("#F8E2BF")
+C_CREME_LONGE = _c("#D9BF99")
+C_ROSA = _c("#EDA89C")
+C_OLHO = _c("#B8DE6C")
+C_PUPILA = _c("#1C120D")
+C_NARIZ = _c("#E8887F")
+C_BOCA = _c("#5E2622")
+C_LINGUA = _c("#EA8A83")
+C_COLAR = _c("#C4584A")
+C_OURO = _c("#EDBA50")
+C_BIGODE = _c("#FFF3DF", 235)
+C_BRANCO = _c("#FFFFFF")
+
+
+class _Pincel:
+    """Tela supersampleada; as coordenadas são sempre em 'unidades'."""
+
+    def __init__(self, k, larg=LARG, alt=ALT, modo="RGBA"):
+        self.modo = modo
+        self.w = max(8, round(larg * k))
+        self.h = max(8, round(alt * k))
+        self.m = SS * self.w / larg
+        vazio = (0, 0, 0, 0) if modo == "RGBA" else 0
+        self.im = Image.new(modo, (self.w * SS, self.h * SS), vazio)
+        self.d = ImageDraw.Draw(self.im)
+
+    def circ(self, x, y, r, cor):
+        m = self.m
+        self.d.ellipse((m * (x - r), m * (y - r), m * (x + r), m * (y + r)), fill=cor)
+
+    def poly(self, pts, cor):
+        m = self.m
+        self.d.polygon([(m * x, m * y) for x, y in pts], fill=cor)
+
+    def linha(self, pts, larg, cor):
+        m = self.m
+        self.d.line([(m * x, m * y) for x, y in pts], fill=cor,
+                    width=max(1, round(m * larg)), joint="curve")
+        for x, y in (pts[0], pts[-1]):
+            self.circ(x, y, larg / 2, cor)
+
+    def pronto(self):
+        return self.im.reduce(SS)
+
+
+def _elipse(cx, cy, rx, ry, rot=0.0, n=30):
+    c, s = math.cos(rot), math.sin(rot)
+    pts = []
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        x, y = rx * math.cos(a), ry * math.sin(a)
+        pts.append((cx + x * c - y * s, cy + x * s + y * c))
+    return pts
+
+
+def _expandir(pts, d):
+    cx = sum(x for x, _ in pts) / len(pts)
+    cy = sum(y for _, y in pts) / len(pts)
+    out = []
+    for x, y in pts:
+        vx, vy = x - cx, y - cy
+        n = math.hypot(vx, vy) or 1.0
+        out.append((x + vx / n * d, y + vy / n * d))
+    return out
+
+
+def _cortar(pts, a, b, ref):
+    """Mantém a parte do polígono que fica do mesmo lado de `ref` em relação à reta a-b."""
+    def lado(q):
+        return (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0])
+    s = 1.0 if lado(ref) >= 0 else -1.0
+    out = []
+    n = len(pts)
+    for i in range(n):
+        p0, p1 = pts[i], pts[(i + 1) % n]
+        d0, d1 = s * lado(p0), s * lado(p1)
+        if d0 >= 0:
+            out.append(p0)
+        if (d0 >= 0) != (d1 >= 0):
+            t = d0 / (d0 - d1)
+            out.append((p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t))
+    return out
+
+
+def _bez(p0, p1, p2, n):
+    out = []
+    for i in range(n + 1):
+        t = i / n
+        a, b, c = (1 - t) ** 2, 2 * (1 - t) * t, t * t
+        out.append((a * p0[0] + b * p1[0] + c * p2[0], a * p0[1] + b * p1[1] + c * p2[1]))
+    return out
+
+
+def _trilha(p, pts, raios, cor, passo=2.4, desde=0.0):
+    """Carimba círculos ao longo de uma polilinha (forma 'cápsula' de largura variável)."""
+    n = len(pts) - 1
+    if n < 1:
+        return
+    comp = [math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) for i in range(n)]
+    total = sum(comp) or 1.0
+    acum = 0.0
+    for i in range(n):
+        (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+        r0, r1 = raios[i], raios[i + 1]
+        k = max(1, int(comp[i] / passo) + 1)
+        for j in range(k + 1 if i == n - 1 else k):
+            t = j / k
+            if (acum + comp[i] * t) / total < desde:
+                continue
+            p.circ(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r0 + (r1 - r0) * t, cor)
+        acum += comp[i]
+
+
+def _perna(raiz, pe, a, b, lado):
+    """Cinemática inversa de 2 ossos. lado=+1 cotovelo para trás, -1 joelho para frente."""
+    fx, fy = pe[0], pe[1] - RAIO_PATA
+    dx, dy = fx - raiz[0], fy - raiz[1]
+    dist = max(abs(a - b) + 0.5, min(math.hypot(dx, dy), a + b - 0.5))
+    base = math.atan2(dy, dx)
+    cos_a = (a * a + dist * dist - b * b) / (2 * a * dist)
+    ang = base + lado * math.acos(max(-1.0, min(1.0, cos_a)))
+    junta = (raiz[0] + a * math.cos(ang), raiz[1] + a * math.sin(ang))
+    ponta = (raiz[0] + dist * math.cos(base), raiz[1] + dist * math.sin(base))
+    return [raiz, junta, ponta]
+
+
+def _desenhar_perna(p, pts, longe, traseira):
+    cor = C_PELO_LONGE if longe else C_PELO
+    meia = C_CREME_LONGE if longe else C_CREME
+    raios = [13.0, 8.8, 7.6] if traseira else [11.0, 8.2, 7.6]
+    _trilha(p, pts, [r + 2.3 for r in raios], C_CONTORNO, desde=0.0 if longe else 0.22)
+    _trilha(p, pts, raios, cor)
+    a, b = pts[1], pts[2]
+    meio = (a[0] + (b[0] - a[0]) * 0.5, a[1] + (b[1] - a[1]) * 0.5)
+    _trilha(p, [meio, b], [7.9, 7.6], meia)
+
+
+def _cauda(p, hip, ang, curl, amp, fase, puff):
+    n = 24
+    seg = 100.0 / n
+    x, y = hip[0] - 12, hip[1] - 2
+    pts = [(x, y)]
+    for i in range(1, n + 1):
+        u = i / n
+        a = math.radians(ang + curl * u + amp * u * math.sin(fase - 6.9 * u))
+        x += seg * math.cos(a)
+        y += seg * math.sin(a)
+        pts.append((x, y))
+    raios = [(8.4 - 3.3 * (i / n)) * (1 + 0.55 * puff) for i in range(n + 1)]
+    for (px, py), r in zip(pts, raios):
+        p.circ(px, py, r + 2.3, C_CONTORNO)
+    for i, ((px, py), r) in enumerate(zip(pts, raios)):
+        if i >= n - 1:
+            cor = C_PONTA
+        elif i % 7 >= 5:
+            cor = C_PELO_ESC
+        else:
+            cor = C_PELO
+        p.circ(px, py, r, cor)
+
+
+def _cabeca(p, hx, hy, rot, look, eye, anger, mouth, ear):
+    ca, sa = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+    lx, ly = look
+
+    def H(x, y):
+        return (hx + x * ca - y * sa, hy + x * sa + y * ca)
+
+    def F(x, y):
+        return H(x + lx, y + ly)
+
+    ol = 2.2
+    jaw = 15.0 + mouth * 9.0
+
+    # coleira com a medalha em mira (o "alvo" do app)
+    centro = [(x, 27.5 + 3.8 * (1 - (x / 18.0) ** 2)) for x in (-17, -12.75, -8.5, -4.25, 0, 4.25, 8.5, 12.75, 17)]
+    pts = [H(x, y) for x, y in centro]
+    p.linha(pts, 9.8, C_CONTORNO)
+    p.linha(pts, 7.2, C_COLAR)
+    tx, ty = H(0, 36.8)
+    p.circ(tx, ty, 5.8, C_CONTORNO)
+    p.circ(tx, ty, 4.4, C_OURO)
+    p.linha([H(-3.0, 36.8), H(3.0, 36.8)], 0.9, C_CONTORNO)
+    p.linha([H(0, 33.8), H(0, 39.8)], 0.9, C_CONTORNO)
+    p.circ(tx, ty, 2.3, C_CONTORNO)
+    p.circ(tx, ty, 1.4, C_OURO)
+
+    # orelhas
+    tipx, tipy = -22 + (-46 + 22) * ear, -45 + (-16 + 45) * ear
+    for sg in (-1, 1):
+        ponta = (tipx if sg < 0 else -tipx, tipy)
+        tri = [H(sg * 28, -9), H(sg * 6, -26), H(*ponta)]
+        p.poly(_expandir(tri, ol), C_CONTORNO)
+        p.poly(tri, C_PELO)
+        cx = sum(x for x, _ in tri) / 3
+        cy = sum(y for _, y in tri) / 3
+        dentro = [(cx + (x - cx) * 0.52, cy + (y - cy) * 0.52) for x, y in tri]
+        p.poly(dentro, C_ROSA)
+
+    # crânio, bochechas e mandíbula (contorno unificado)
+    cranio = [H(x, y) for x, y in _elipse(0, 0, 27.0, 24.5)]
+    p.poly(_expandir(cranio, ol), C_CONTORNO)
+    for sg in (-1, 1):
+        p.circ(*H(sg * 17, 9), 14.5 + ol, C_CONTORNO)
+    p.circ(*H(0, jaw), 13.5 + ol, C_CONTORNO)
+    p.poly(cranio, C_PELO)
+    for sg in (-1, 1):
+        p.circ(*H(sg * 17, 9), 14.5, C_PELO)
+    p.circ(*H(0, jaw), 13.5, C_PELO)
+
+    # listras da testa e das bochechas
+    for x0, x1, y0, y1 in ((0, 0, -23, -14), (-7.5, -6, -22, -15), (7.5, 6, -22, -15)):
+        p.linha([H(x0, y0), H(x1, y1)], 2.3, C_PELO_ESC)
+    for sg in (-1, 1):
+        p.linha([H(sg * 25, 1), H(sg * 18.5, 3.2)], 2.0, C_PELO_ESC)
+        p.linha([H(sg * 25.5, 6.5), H(sg * 19.5, 7.8)], 2.0, C_PELO_ESC)
+
+    # focinho creme
+    p.circ(*F(-5.6, 10.6), 8.2, C_CREME)
+    p.circ(*F(5.6, 10.6), 8.2, C_CREME)
+    p.circ(*F(0, 12.8), 7.2, C_CREME)
+    p.circ(*F(0, jaw + 2.5), 8.0, C_CREME)
+
+    # olhos
+    for sg in (-1, 1):
+        ex, ey = sg * 11.6, -3.2
+        if eye < 0.14:
+            arco = [F(ex - 6.2, ey + 2.4), F(ex - 3.1, ey - 0.9), F(ex, ey - 2.2),
+                    F(ex + 3.1, ey - 0.9), F(ex + 6.2, ey + 2.4)]
+            p.linha(arco, 2.3, C_CONTORNO)
+            continue
+        ry = 7.6 * eye
+        borda = _elipse(ex, ey, 7.8, ry + 1.4)
+        iris = _elipse(ex, ey, 6.5, ry)
+        pupila = _elipse(ex, ey, 1.9, ry * 0.9)
+        if anger > 0.12:
+            yi = ey - 8.5 + 6.2 * anger
+            yo = ey - 8.5 - 2.4 * anger
+            a_, b_, ref = (sg * 1.5, yi), (sg * 21, yo), (ex, ey + 5)
+            borda = _cortar(borda, a_, b_, ref)
+            iris = _cortar(iris, a_, b_, ref)
+            pupila = _cortar(pupila, a_, b_, ref)
+        p.poly([F(*q) for q in borda], C_CONTORNO)
+        p.poly([F(*q) for q in iris], C_OLHO)
+        p.poly([F(*q) for q in pupila], C_PUPILA)
+        if anger < 0.5:
+            p.circ(*F(ex + 2.2, ey - 2.2 * eye), 1.5, C_BRANCO)
+        else:
+            p.linha([F(*a_), F(*b_)], 2.6, C_CONTORNO)
+
+    # nariz e boca
+    p.poly([F(-3.9, 4.0), F(3.9, 4.0), F(0, 9.2)], C_NARIZ)
+    if mouth > 0.07:
+        cy = 15.5 + mouth * 5.2
+        rx, ry = 6.2 + 3.6 * mouth, 1.6 + 8.0 * mouth
+        p.poly([F(x, y) for x, y in _elipse(0, cy, rx + 1.6, ry + 1.6)], C_CONTORNO)
+        p.poly([F(x, y) for x, y in _elipse(0, cy, rx, ry)], C_BOCA)
+        p.poly([F(x, y) for x, y in _elipse(0, cy + ry * 0.42, rx * 0.62, ry * 0.5)], C_LINGUA)
+        if mouth > 0.22:
+            for sg in (-1, 1):
+                fx = sg * rx * 0.62
+                topo = cy - ry + 0.6
+                p.poly([F(fx - 1.9, topo), F(fx + 1.9, topo), F(fx, topo + 2.0 + 4.6 * mouth)], C_BRANCO)
+    else:
+        p.linha([F(0, 9), F(0, 11.6)], 1.5, C_CONTORNO)
+        for sg in (-1, 1):
+            p.linha([F(sg * 7.6, 12.0), F(sg * 4.4, 14.3), F(0, 11.6)], 1.5, C_CONTORNO)
+
+    # bigodes
+    for sg in (-1, 1):
+        for i, dy in enumerate((-2.4, 2.2, 6.6)):
+            y0 = 11.0 + i * 1.8
+            p.linha([F(sg * 10.5, y0), F(sg * 22, y0 + dy * 0.5),
+                     F(sg * (36 - 5 * ear), y0 + dy)], 1.3, C_BIGODE)
+
+
+def desenhar_gato(pose, k):
+    """Desenha um quadro do gato (RGBA, lado direito para frente) a partir de uma pose."""
+    p = _Pincel(k)
+    hip, sh, arch = pose["hip"], pose["sh"], pose["arch"]
+    ang, curl, amp, fase, puff = pose["tail"]
+    _cauda(p, hip, ang, curl, amp, fase, puff)
+
+    perna_fh = _perna((hip[0] + 3, hip[1] + 11), pose["fh"], 36, 34, -1)
+    perna_ff = _perna((sh[0] - 3, sh[1] + 11), pose["ff"], 34, 34, +1)
+    perna_nh = _perna((hip[0] - 3, hip[1] + 11), pose["nh"], 36, 34, -1)
+    perna_nf = _perna((sh[0] + 5, sh[1] + 11), pose["nf"], 34, 34, +1)
+    _desenhar_perna(p, perna_fh, True, True)
+    _desenhar_perna(p, perna_ff, True, False)
+
+    # tronco + pescoço
+    mx, my = (hip[0] + sh[0]) / 2, (hip[1] + sh[1]) / 2 - 2 * arch
+    espinha = _bez(hip, (mx, my), sh, 12)
+    us = [i / 12 for i in range(13)]
+    raios = [24.5 + 4.5 * u + 2.2 * math.sin(math.pi * u) for u in us]
+    hx, hy = pose["head"]
+    pescoco = [(sh[0] + 8, sh[1] - 4), (hx - 2, hy + 16)]
+    r_pesc = [18.0, 15.0]
+    _trilha(p, espinha, [r + 2.3 for r in raios], C_CONTORNO)
+    _trilha(p, pescoco, [r + 2.3 for r in r_pesc], C_CONTORNO)
+    _trilha(p, espinha, raios, C_PELO)
+    _trilha(p, pescoco, r_pesc, C_PELO)
+
+    # barriga/peito creme e listras, recortados pela silhueta do corpo
+    corpo = _Pincel(k, modo="L")
+    for (x, y), r in zip(espinha, raios):
+        corpo.circ(x, y, r, 255)
+    _trilha(corpo, pescoco, r_pesc, 255)
+    cremes = _Pincel(k, modo="L")
+    for (x, y), r in zip(espinha, raios):
+        cremes.circ(x, y + r * 0.62, r * 0.62, 255)
+    cremes.circ(sh[0] + 8, sh[1] + 10, 15.5, 255)
+    cremes.circ(hx, hy + 20, 9.5, 255)
+    p.im.paste(C_CREME, (0, 0), ImageChops.multiply(corpo.im, cremes.im))
+    listras = _Pincel(k, modo="L")
+    for i in (1, 3, 5, 7, 9):
+        x, y = espinha[i]
+        r = raios[i]
+        listras.linha([(x + 4, y - r - 3), (x - 3, y - r * 0.2)], 5.2, 255)
+    p.im.paste(C_PELO_ESC, (0, 0), ImageChops.multiply(corpo.im, listras.im))
+
+    _desenhar_perna(p, perna_nh, False, True)
+    _desenhar_perna(p, perna_nf, False, False)
+    _cabeca(p, hx, hy, pose["rot"], pose["look"], pose["eye"], pose["anger"], pose["mouth"], pose["ear"])
+    return p.pronto()
+
+
+def desenhar_icone(k=1.0):
+    """Rosto do gato para o logo do cabeçalho."""
+    p = _Pincel(k)
+    _cabeca(p, 180, 112, 0, (0, 0), 1.0, 0.0, 0.0, 0.0)
+    im = p.pronto()
+    u = p.w / LARG
+    return im.crop((int((180 - 50) * u), int((112 - 50) * u), int((180 + 50) * u), int((112 + 58) * u)))
+
+
+# ---------------------------------------------------------------- poses
+BASE = dict(
+    hip=(115.0, 126.0), sh=(212.0, 126.0), arch=3.0,
+    head=(252.0, 90.0), rot=0.0, look=(0.0, 0.0),
+    eye=1.0, anger=0.0, mouth=0.0, ear=0.0,
+    tail=(-118.0, 62.0, 5.0, 0.0, 0.0),
+    nh=(104.0, CHAO), nf=(228.0, CHAO), fh=(122.0, CHAO), ff=(210.0, CHAO),
+)
+
+
+def _mix(a, b, u):
+    if isinstance(a, tuple):
+        return tuple(_mix(x, y, u) for x, y in zip(a, b))
+    return a + (b - a) * u
+
+
+def _misturar(pa, pb, u):
+    return {k: _mix(pa[k], pb[k], u) for k in pa}
+
+
+def _suave(u):
+    u = max(0.0, min(1.0, u))
+    return u * u * u * (u * (u * 6 - 15) + 10)
+
+
+def _trans(pa, pb, n):
+    return [_misturar(pa, pb, _suave(i / (n - 1))) for i in range(n)]
+
+
+def pose_andar(ph):
+    sw = 0.62
+    S = sw * DC
+
+    def pe(off, rx):
+        q = (ph + off) % 1.0
+        if q < sw:
+            x, y = S / 2 - S * (q / sw), 0.0
+        else:
+            u = (q - sw) / (1 - sw)
+            x, y = -S / 2 + S * (u * u * (3 - 2 * u)), -9.0 * math.sin(math.pi * u)
+        return (rx + x, CHAO + y)
+
+    bob = math.cos(4 * math.pi * ph)
+    dy = -1.7 * bob
+    p = dict(BASE)
+    p.update(
+        hip=(115.0, 126.0 + dy * 0.8), sh=(212.0, 126.0 + dy), arch=3.0 + bob,
+        head=(251.0, 91.0 + dy * 1.4), rot=1.5 * math.sin(2 * math.pi * ph), look=(1.5, 0.0),
+        tail=(-124.0, 58.0, 9.0, 2 * math.pi * ph, 0.0),
+        nh=pe(0.0, 111.0), nf=pe(0.25, 218.0), fh=pe(0.5, 111.0), ff=pe(0.75, 218.0),
+    )
+    return p
+
+
+def pose_rosnar(ph):
+    def s(k):
+        return math.sin(2 * math.pi * k * ph)
+    tx, ty = 1.1 * s(13), 0.9 * s(11)
+    p = dict(BASE)
+    p.update(
+        hip=(110.0 + tx * 0.6, 152.0 + ty), sh=(206.0 + tx, 160.0 + ty * 0.7), arch=14.0,
+        head=(255.0 + tx * 1.4, 140.0 + ty * 1.2), rot=3.0 * s(5), look=(0.0, 2.5),
+        eye=0.8, anger=1.0, mouth=0.55 - 0.4 * math.cos(2 * math.pi * 2 * ph), ear=1.0,
+        tail=(-112.0, -42.0, 24.0, 2 * math.pi * 2 * ph, 1.0),
+        nh=(100.0, CHAO), fh=(118.0, CHAO), nf=(238.0, CHAO), ff=(222.0, CHAO),
+    )
+    return p
+
+
+def pose_downdog(ph):
+    u = max(0.0, min(1.0, (ph - 0.08) / 0.84))
+    boca = 0.95 * math.sin(math.pi * u) ** 1.3
+    tt = 0.7 * math.sin(2 * math.pi * 9 * ph)
+    p = dict(BASE)
+    p.update(
+        hip=(98.0, 119.0 + tt * 0.3), sh=(188.0, 164.0 + tt * 0.3), arch=-5.0,
+        head=(236.0, 168.0 + tt * 0.5), rot=-6.0, look=(2.0, 3.0),
+        eye=0.0, anger=0.0, mouth=boca, ear=0.3,
+        tail=(-84.0, 26.0, 6.0, 2 * math.pi * ph, 0.0),
+        nh=(90.0, CHAO), fh=(106.0, CHAO), nf=(254.0, CHAO), ff=(238.0, CHAO),
+    )
+    return p
+
+
+def pose_arco(ph):
+    tt = 0.6 * math.sin(2 * math.pi * 7 * ph)
+    p = dict(BASE)
+    p.update(
+        hip=(128.0, 134.0 + tt * 0.3), sh=(196.0, 140.0 + tt * 0.3), arch=30.0,
+        head=(238.0, 152.0 + tt * 0.4), rot=-8.0, look=(2.0, 3.0),
+        eye=0.0, anger=0.0, mouth=0.0, ear=0.25,
+        tail=(-96.0, 6.0, 4.0, 0.0, 0.0),
+        nh=(120.0, CHAO), fh=(136.0, CHAO), nf=(204.0, CHAO), ff=(188.0, CHAO),
+    )
+    return p
+
+
+def montar_clips():
+    stand = dict(BASE)
+    return {
+        "andar": [pose_andar(i / NW) for i in range(NW)],
+        "parar": _trans(pose_andar(0.0), stand, 8),
+        "rosnar_in": _trans(stand, pose_rosnar(0.0), 10),
+        "rosnar": [pose_rosnar(i / NR) for i in range(NR)],
+        "rosnar_out": _trans(pose_rosnar(0.0), stand, 10),
+        "esp1": (_trans(stand, pose_downdog(0.0), 22)[:-1]
+                 + [pose_downdog(i / 28) for i in range(28)]
+                 + _trans(pose_downdog(1.0), stand, 18)),
+        "esp2": (_trans(stand, pose_arco(0.0), 15)[:-1]
+                 + [pose_arco(i / 12) for i in range(12)]
+                 + _trans(pose_arco(1.0), stand, 15)),
+        "partir": _trans(stand, pose_andar(0.0), 7),
+    }
+
+
+def tamanho_sprite(k):
+    return max(8, round(LARG * k)), max(8, round(ALT * k))
+
+
+def gerar_quadros_gato(k, ao_progresso=None):
+    """Renderiza todos os quadros (comprimidos) — roda numa thread, sem tocar no Tk."""
+    clips = montar_clips()
+    total = sum(len(v) for v in clips.values())
+    feitos = 0
+    saida = {}
+    for nome, poses in clips.items():
+        quadros = []
+        for pose in poses:
+            im = desenhar_gato(pose, k)
+            quadros.append(zlib.compress(im.tobytes(), 1))
+            feitos += 1
+            if ao_progresso:
+                ao_progresso(feitos / total)
+        saida[nome] = quadros
+    return saida
+
+
+def decodificar(dados, tamanho):
+    return Image.frombytes("RGBA", tamanho, zlib.decompress(dados))
+
+
+# ---------------------------------------------------------------- xícara e fumaça
+def desenhar_xicara(k):
+    W, Hh = 120, 92
+    p = _Pincel(k, W, Hh)
+    ol = C_CONTORNO
+    # sombra suave
+    for rx, ry, a in ((54, 9.5, 22), (46, 8, 34), (38, 6.5, 46)):
+        p.poly(_elipse(60, 82, rx, ry), (0, 0, 0, a))
+    # pires
+    p.poly(_elipse(60, 78.5, 51, 10.4), _c("#B9A184"))
+    p.poly(_elipse(60, 76, 49.5, 9.6), _c("#EFE2CF"))
+    p.poly(_elipse(60, 75.5, 33, 6.3), _c("#DECCB3"))
+    # alça
+    p.poly(_elipse(98, 50, 16.8, 14.6), ol)
+    p.poly(_elipse(98, 50, 15, 12.8), _c("#EFE2CF"))
+    p.poly(_elipse(98, 50, 9.6, 8.2), ol)
+    p.poly(_elipse(98, 50, 7.8, 6.5), (0, 0, 0, 0))
+    # corpo
+    lado_e = [(22, 40), (24, 52), (30, 64), (37, 72)]
+    lado_d = [(83, 72), (90, 64), (96, 52), (98, 40)]
+    arco = [(60 + 23 * math.cos(math.radians(a)), 72 + 6.5 * math.sin(math.radians(a))) for a in range(170, 9, -10)]
+    corpo = lado_e + arco[::-1] + lado_d
+    p.poly(_expandir(corpo, 1.8), ol)
+    p.poly(corpo, _c("#F7EEDF"))
+    p.poly([(86, 42), (98, 40), (96, 52), (90, 64), (83, 72), (76, 74), (80, 62), (84, 50)], _c("#E8D9C2"))
+    # boca da xícara e café
+    p.poly(_elipse(60, 39, 39.8, 11.2), ol)
+    p.poly(_elipse(60, 39, 38, 9.8), _c("#FFF7EA"))
+    p.poly(_elipse(60, 40, 33, 8.2), _c("#4A2A1A"))
+    p.poly(_elipse(60, 40.6, 31.2, 7.2), _c("#7B4A2B"))
+    p.poly(_elipse(60, 40.6, 24, 5.3), _c("#8A5733"))
+    # coração de latte art
+    coracao = []
+    for i in range(41):
+        t = 2 * math.pi * i / 40
+        x = 16 * math.sin(t) ** 3
+        y = -(13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t))
+        coracao.append((60 + x * 0.62, 40.6 + y * 0.2 + 0.4))
+    p.poly(coracao, _c("#F3DFC2"))
+    return p.pronto()
+
+
+def gerar_vapor(k, n=48):
+    """Fumaça em laço perfeito: cada partícula sobe, se alarga e some."""
+    W, Hh = 90, 120
+    ss = 2
+    w, h = max(8, round(W * k)), max(8, round(Hh * k))
+    m = ss * w / W
+    correntes = [(29.0, 7.0, 1.3, 0.0), (45.0, 8.0, 1.0, 2.1), (61.0, 6.5, 1.4, 4.2)]
+    saida = []
+    for f in range(n):
+        t = f / n
+        mask = Image.new("L", (w * ss, h * ss), 0)
+        d = ImageDraw.Draw(mask)
+        partic = []
+        for j, (x0, amp, cic, fase) in enumerate(correntes):
+            for i in range(14):
+                u = (t + i / 14 + j * 0.31) % 1.0
+                y = Hh - 4 - u * (Hh - 14)
+                x = x0 + amp * (0.35 + u) * math.sin(2 * math.pi * (cic * u + t) + fase)
+                a = (math.sin(math.pi * u) ** 1.3) * 190
+                r = 2.9 + 5.6 * u
+                partic.append((a, x, y, r))
+        for a, x, y, r in sorted(partic):
+            d.ellipse((m * (x - r), m * (y - r), m * (x + r), m * (y + r)), fill=int(a))
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=1.5 * m))
+        alfa = mask.reduce(ss)
+        im = Image.new("RGBA", alfa.size, (255, 246, 232, 0))
+        im.putalpha(alfa)
+        saida.append(zlib.compress(im.tobytes(), 1))
+    return saida, (w, h)
+
+
+def tamanho_xicara(k):
+    return max(8, round(120 * k)), max(8, round(92 * k))
+
+
+# ---------------------------------------------------------------- cena estática
+def geometria(w, h, esc):
+    topo = h - 78 * esc
+    return {
+        "topo": topo,                    # início do tampo do balcão
+        "pes": topo + 40 * esc,          # linha dos pés do gato
+        "xic_x": w - 128 * esc,          # centro da xícara
+        "xic_y": topo + 38 * esc,        # base da xícara
+    }
+
+
+def renderizar_cena(w, h, esc):
+    """Parede com luz quente e balcão de madeira (uma única imagem de fundo).
+
+    A parede é quase lisa atrás dos painéis; só o cabeçalho e o palco têm brilhos."""
+    g = geometria(w, h, esc)
+    sw, shh = max(8, w // 4), max(8, h // 4)
+    ys = np.linspace(0, 1, shh)[:, None, None]
+    alta = np.array(_rgb(T.PAREDE_ALTA), float)[None, None, :]
+    base = np.array(_rgb(T.PAREDE_BASE), float)[None, None, :]
+    arr = np.repeat(alta * (1 - ys) + base * ys, sw, axis=1)
+    xx = np.linspace(0, w, sw)[None, :]
+    yy = np.linspace(0, h, shh)[:, None]
+    rng = np.random.default_rng(11)
+    luz = np.array([255, 196, 120], float)
+    faixa_palco = h - 214 * esc
+    luzes = []
+    for _ in range(5):   # cabeçalho
+        luzes.append((rng.uniform(0.03, 0.97) * w, rng.uniform(0.0, 90) * esc,
+                      rng.uniform(40, 85) * esc, rng.uniform(0.05, 0.10)))
+    for _ in range(4):   # palco
+        luzes.append((rng.uniform(0.03, 0.97) * w, rng.uniform(faixa_palco, g["topo"]),
+                      rng.uniform(45, 90) * esc, rng.uniform(0.05, 0.10)))
+    luzes.append((g["xic_x"], g["xic_y"] - 70 * esc, 130 * esc, 0.16))
+    for cx, cy, sig, it in luzes:
+        d2 = ((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sig * sig)
+        arr += (np.exp(-d2) * it)[..., None] * luz
+    sombra = np.clip((yy - (g["topo"] - 46 * esc)) / (46 * esc), 0, 1)
+    arr *= (1 - 0.20 * sombra)[..., None]
+    im = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB").resize((w, h), Image.BICUBIC)
+
+    d = ImageDraw.Draw(im)
+    topo = int(g["topo"])
+    frente = int(topo + 50 * esc)
+    ca, cb = _rgb(T.MADEIRA_CLARA), _rgb(T.MADEIRA)
+    for y in range(topo, frente):
+        t = (y - topo) / max(1, frente - topo)
+        d.line([(0, y), (w, y)], fill=tuple(int(ca[i] + (cb[i] - ca[i]) * t) for i in range(3)))
+    d.rectangle([0, frente, w, h], fill=_rgb(T.MADEIRA_FRENTE))
+    veio = tuple(int(c * 0.86) for c in cb)
+    for fy in (0.22, 0.45, 0.7):
+        y = int(topo + (frente - topo) * fy)
+        d.line([(0, y), (w, y)], fill=veio, width=max(1, int(esc)))
+    for x in range(int(90 * esc), w, int(260 * esc)):
+        d.line([(x, topo), (x - int(12 * esc), frente)], fill=veio, width=max(1, int(1.5 * esc)))
+    claro = tuple(min(255, int(c * 1.22)) for c in ca)
+    d.line([(0, topo), (w, topo)], fill=claro, width=max(2, int(2 * esc)))
+    d.line([(0, frente), (w, frente)], fill=tuple(int(c * 0.7) for c in _rgb(T.MADEIRA_FRENTE)),
+           width=max(2, int(2 * esc)))
+    escuro = tuple(int(c * 0.82) for c in _rgb(T.MADEIRA_FRENTE))
+    for x in range(int(140 * esc), w, int(300 * esc)):
+        d.line([(x, frente + int(3 * esc)), (x, h)], fill=escuro, width=max(1, int(2 * esc)))
+    return im
+
+
+# ==================== ui/widgets.py ====================
+from PIL import ImageTk
+
+_FAMILIAS: set | None = None
+
+
+def _familias(root) -> set:
+    global _FAMILIAS
+    if _FAMILIAS is None:
+        _FAMILIAS = set(tkfont.families(root))
+    return _FAMILIAS
+
+
+def fonte(root, tamanho: int = 12, peso: str = "normal", titulo: bool = False):
+    familias = _familias(root)
+    candidatos = (T.FONTE_TITULO, "Cambria", "Times New Roman") if titulo else (T.FONTE_CORPO, *T.FONTE_FALLBACKS)
+    familia = next((nome for nome in candidatos if nome in familias), "Arial")
+    return familia, tamanho, peso
+
+
+def cartao(pai, raio: int = 20, **kwargs):
+    cor_fundo = kwargs.pop("fg_color", T.PAINEL)
+    return ctk.CTkFrame(pai, fg_color=cor_fundo, border_color=T.BORDA, border_width=1,
+                        corner_radius=raio, **kwargs)
+
+
+_ESTILOS_BOTAO = {
+    "primario": dict(fg_color=T.CARAMELO, hover_color=T.CARAMELO_ESC, text_color=T.ESPRESSO, border_width=0),
+    "suave": dict(fg_color=T.CARTAO, hover_color=T.CARTAO_HOVER, text_color=T.TEXTO,
+                  border_width=1, border_color=T.BORDA),
+    "perigo": dict(fg_color=T.CARTAO, hover_color=T.TERRACOTA_ESC, text_color=T.TERRACOTA,
+                   border_width=1, border_color=T.BORDA),
+    "discreto": dict(fg_color="transparent", hover_color=T.CARTAO_HOVER, text_color=T.SUAVE, border_width=0),
+}
+
+
+def botao(pai, texto: str, comando=None, *, estilo: str = "suave", **kwargs):
+    altura = kwargs.pop("height", 38)
+    raio = kwargs.pop("corner_radius", 12)
+    tipografia = kwargs.pop("font", None) or fonte(pai, 12, "bold" if estilo == "primario" else "normal")
+    widget = ctk.CTkButton(pai, text=texto, command=comando, corner_radius=raio, height=altura,
+                           font=tipografia, **_ESTILOS_BOTAO[estilo], **kwargs)
+    if estilo == "perigo":
+        widget.bind("<Enter>", lambda _e: widget.configure(text_color=T.CREME), add="+")
+        widget.bind("<Leave>", lambda _e: widget.configure(text_color=T.TERRACOTA), add="+")
+    return widget
+
+
+def entrada(pai, *, largura: int = 180, **kwargs):
+    largura = kwargs.pop("width", largura)
+    altura = kwargs.pop("height", 36)
+    return ctk.CTkEntry(pai, width=largura, height=altura, fg_color=T.CAMPO, text_color=T.TEXTO,
+                        placeholder_text_color=T.APAGADO, border_color=T.BORDA, border_width=1,
+                        corner_radius=10, font=fonte(pai, 12), **kwargs)
+
+
+def rotulo(pai, texto: str, *, cor: str = T.TEXTO, tamanho: int = 12, peso: str = "normal",
+           titulo: bool = False, **kwargs):
+    tipografia = kwargs.pop("font", None) or fonte(pai, tamanho, peso, titulo)
+    ancora = kwargs.pop("anchor", "w")
+    return ctk.CTkLabel(pai, text=texto, text_color=cor, font=tipografia, anchor=ancora, **kwargs)
+
+
+def _lerp_hex(a: str, b: str, u: float) -> str:
+    u = max(0.0, min(1.0, u))
+    ca, cb = _rgb(a), _rgb(b)
+    return "#%02x%02x%02x" % tuple(int(ca[i] + (cb[i] - ca[i]) * u) for i in range(3))
+
+
+# ==================== ui/cena.py ====================
+VAPOR_FPS = 16
+
+
+class _Seg:
+    """Um trecho da rotina do gato: oculto, andando, tocando um clipe ou parado no último quadro."""
+    __slots__ = ("tipo", "dur", "clip", "x0", "x1", "curva", "rep", "grr")
+
+    def __init__(self, tipo, dur, clip=None, x0=0.0, x1=0.0, curva="linear", rep=1, grr=False):
+        self.tipo, self.dur, self.clip = tipo, dur, clip
+        self.x0, self.x1, self.curva, self.rep, self.grr = x0, x1, curva, rep, grr
+
+
+def _curva(nome: str, u: float) -> float:
+    u = max(0.0, min(1.0, u))
+    if nome == "saida":       # chega rápido e vai freando até parar
+        return 1.0 - (1.0 - u) ** 1.7
+    if nome == "entrada":     # sai devagar e vai acelerando
+        return u ** 1.6
+    return u
+
+
+class Cena(tk.Canvas):
+    """Fundo da janela: parede, balcão, xícara com fumaça e o Hunter Cat.
+
+    Todos os desenhos são criados uma vez (PIL, com suavização) e o Tk só troca quadros e move
+    itens; a posição vem do relógio (não de passos fixos), então o movimento fica liso mesmo
+    quando um quadro demora mais.
+    """
+
+    VEL_CHEGADA = 150.0   # velocidade média ao chegar (unidades do sprite por segundo)
+    VEL_SAIDA = 175.0     # velocidade média ao ir embora
+
+    def __init__(self, master, esc: float):
+        super().__init__(master, bg=T.PAREDE_BASE, highlightthickness=0, bd=0)
+        self.place(x=0, y=0, relwidth=1, relheight=1)
+        self.esc = esc
+        self.k = esc * 0.92
+        self._larg = self._alt = 0
+        self._geo = geometria(1200, 800, esc)
+        self._tam_gato = tamanho_sprite(self.k)
+        self._fotos: dict[str, Any] = {}
+        self._fotos_vapor: list = []
+        self._foto_gato = None
+        self._quadros: dict | None = None
+        self._dados: dict = {}
+        self._etapa1 = threading.Event()
+        self._etapa2 = threading.Event()
+        self._aplicou1 = False
+        self._segs: list[_Seg] = []
+        self._iseg = 0
+        self._t_seg = 0.0
+        self._frame_atual = None
+        self._x = -9999.0
+        self._y_gato = 0.0
+        self._gato_visivel = False
+        self._grr_visivel = False
+        self._i_vapor_atual = -1
+        self._falhas = 0
+        self._ult = time.perf_counter()
+        self._after_tick = self._after_fundo = self._after_espera = None
+        self._timer_alto = False
+
+        familia_titulo = fonte(self, 10, "bold", titulo=True)[0]
+        familia_corpo = fonte(self, 10)[0]
+        s = esc
+        self._i_fundo = self.create_image(0, 0, anchor="nw")
+        self._i_logo = self.create_image(int(28 * s), int(16 * s), anchor="nw")
+        self.create_text(int(112 * s), int(20 * s), anchor="nw", text="Hunter Cat", fill=T.CREME,
+                         font=(familia_titulo, -int(36 * s), "bold"))
+        self.create_text(int(114 * s), int(64 * s), anchor="nw", text="Seu gato caçador de alvos na tela",
+                         fill=T.SUAVE, font=(familia_corpo, -int(14 * s)))
+        self._i_xicara = self.create_image(0, 0, anchor="s", state="hidden")
+        self._i_vapor = self.create_image(0, 0, anchor="s", state="hidden")
+        self._i_gato = self.create_image(0, 0, anchor="nw", state="hidden")
+        self._i_grr = self.create_text(0, 0, anchor="w", text="", fill=T.CREME, state="hidden",
+                                       font=(familia_titulo, -int(24 * s), "bold italic"))
+
+        self.bind("<Configure>", self._ao_redimensionar, add="+")
+        threading.Thread(target=self._preparar, name="hunter-cat-arte", daemon=True).start()
+        self._after_espera = self.after(120, self._aguardar)
+
+    # ------------------------------------------------------------ preparo (thread)
+    def _preparar(self) -> None:
+        """Só PIL/numpy aqui: nada de Tk fora da thread principal."""
+        try:
+            self._dados["icone"] = desenhar_icone(0.62 * self.esc)
+            self._dados["xicara"] = desenhar_xicara(self.k)
+            self._dados["vapor"] = gerar_vapor(self.k, 48)
+        except Exception as erro:
+            self._dados["erro"] = erro
+        finally:
+            self._etapa1.set()
+        try:
+            def ceder(_p):
+                time.sleep(0.003)      # devolve a CPU para a interface durante o preparo
+            self._dados["gato"] = gerar_quadros_gato(self.k, ceder)
+        except Exception as erro:
+            self._dados["erro_gato"] = erro
+        finally:
+            self._etapa2.set()
+
+    def _aguardar(self) -> None:
+        self._after_espera = None
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self._etapa1.is_set() and not self._aplicou1:
+            self._aplicou1 = True
+            self._aplicar_etapa1()
+        if self._etapa2.is_set():
+            self._aplicar_etapa2()
+            return
+        self._after_espera = self.after(150, self._aguardar)
+
+    def _aplicar_etapa1(self) -> None:
+        if "erro" in self._dados:
+            print(f"[hunter-cat] arte indisponível: {self._dados['erro']}", file=sys.stderr)
+            return
+        self._fotos["logo"] = ImageTk.PhotoImage(self._dados["icone"])
+        self.itemconfigure(self._i_logo, image=self._fotos["logo"])
+        self._fotos["xicara"] = ImageTk.PhotoImage(self._dados["xicara"])
+        self.itemconfigure(self._i_xicara, image=self._fotos["xicara"], state="normal")
+        quadros, tam = self._dados["vapor"]
+        self._fotos_vapor = [ImageTk.PhotoImage(decodificar(q, tam)) for q in quadros]
+        self.itemconfigure(self._i_vapor, image=self._fotos_vapor[0], state="normal")
+        self._posicionar()
+        self._timer_preciso(True)
+        self._ult = time.perf_counter()
+        self._after_tick = self.after(16, self._tick)
+
+    def _aplicar_etapa2(self) -> None:
+        if "erro_gato" in self._dados:
+            print(f"[hunter-cat] gato indisponível: {self._dados['erro_gato']}", file=sys.stderr)
+            return
+        self._quadros = self._dados["gato"]
+        self._foto_gato = ImageTk.PhotoImage(Image.new("RGBA", self._tam_gato, (0, 0, 0, 0)))
+        self.itemconfigure(self._i_gato, image=self._foto_gato)
+
+    # ------------------------------------------------------------ geometria
+    def _ao_redimensionar(self, evento) -> None:
+        if evento.widget is not self:
+            return
+        w, h = max(1, evento.width), max(1, evento.height)
+        if (w, h) == (self._larg, self._alt):
+            return
+        self._larg, self._alt = w, h
+        self._posicionar()
+        if self._after_fundo is not None:
+            self.after_cancel(self._after_fundo)
+        self._after_fundo = self.after(110, self._refazer_fundo)
+
+    def _posicionar(self) -> None:
+        w, h = self._larg or 1200, self._alt or 800
+        g = self._geo = geometria(w, h, self.esc)
+        self.coords(self._i_xicara, g["xic_x"], g["xic_y"])
+        self.coords(self._i_vapor, g["xic_x"] - 2 * self.k, g["xic_y"] - 52 * self.k)
+        self._y_gato = g["pes"] - CHAO * self.k
+        if self._gato_visivel:
+            self.coords(self._i_gato, self._x, self._y_gato)
+
+    def _refazer_fundo(self) -> None:
+        self._after_fundo = None
+        if self._larg < 50 or self._alt < 50:
+            return
+        try:
+            self._fotos["fundo"] = ImageTk.PhotoImage(renderizar_cena(self._larg, self._alt, self.esc))
+            self.itemconfigure(self._i_fundo, image=self._fotos["fundo"])
+        except Exception as erro:
+            print(f"[hunter-cat] fundo indisponível: {erro}", file=sys.stderr)
+
+    # ------------------------------------------------------------ rotina do gato
+    def _montar_ciclo(self) -> list[_Seg]:
+        k = self.k
+        largura = max(self._larg, 900)
+        larg_spr = LARG * k
+        dc = DC * k
+        x_parada = max(24.0, largura * 0.28 - larg_spr * 0.4)
+        n1 = max(2, math.ceil((x_parada + larg_spr + 20) / dc))
+        n2 = max(2, math.ceil((largura - x_parada + 40) / dc))
+        dur1 = n1 * dc / (self.VEL_CHEGADA * k)
+        dur2 = n2 * dc / (self.VEL_SAIDA * k)
+
+        def d(nome):
+            return len(self._quadros[nome]) / FPS_CLIP
+
+        return [
+            _Seg("oculto", 2.0),
+            _Seg("andar", dur1, x0=x_parada - n1 * dc, x1=x_parada, curva="saida"),
+            _Seg("clip", d("parar"), "parar", x0=x_parada),
+            _Seg("clip", d("rosnar_in"), "rosnar_in", x0=x_parada),
+            _Seg("clip", 2 * d("rosnar"), "rosnar", x0=x_parada, rep=2, grr=True),
+            _Seg("clip", d("rosnar_out"), "rosnar_out", x0=x_parada),
+            _Seg("segurar", 0.35, "rosnar_out", x0=x_parada),
+            _Seg("clip", d("esp1"), "esp1", x0=x_parada),
+            _Seg("segurar", 0.25, "esp1", x0=x_parada),
+            _Seg("clip", d("esp2"), "esp2", x0=x_parada),
+            _Seg("segurar", 0.45, "esp2", x0=x_parada),
+            _Seg("clip", d("partir"), "partir", x0=x_parada),
+            _Seg("andar", dur2, x0=x_parada, x1=x_parada + n2 * dc, curva="entrada"),
+        ]
+
+    def _tick(self) -> None:
+        self._after_tick = None
+        try:
+            visivel = bool(self.winfo_viewable())
+        except tk.TclError:
+            return
+        agora = time.perf_counter()
+        if not visivel:                       # minimizado: não gasta CPU
+            self._ult = agora
+            self._after_tick = self.after(250, self._tick)
+            return
+        dt = min(0.05, agora - self._ult)
+        self._ult = agora
+        try:
+            self._passo(agora, dt)
+        except tk.TclError:
+            return
+        except Exception as erro:             # animação nunca derruba a interface
+            self._falhas += 1
+            if self._falhas > 5:
+                print(f"[hunter-cat] animação desligada: {erro}", file=sys.stderr)
+                return
+        gasto = (time.perf_counter() - agora) * 1000
+        self._after_tick = self.after(max(1, int(1000 / 60 - gasto)), self._tick)
+
+    def _passo(self, agora: float, dt: float) -> None:
+        if self._fotos_vapor:
+            i = int(agora * VAPOR_FPS) % len(self._fotos_vapor)
+            if i != self._i_vapor_atual:
+                self._i_vapor_atual = i
+                self.itemconfigure(self._i_vapor, image=self._fotos_vapor[i])
+        if not self._quadros or self._foto_gato is None:
+            return
+        if not self._segs:
+            self._segs, self._iseg, self._t_seg = self._montar_ciclo(), 0, 0.0
+        self._t_seg += dt
+        seg = self._segs[self._iseg]
+        while self._t_seg >= seg.dur:
+            self._t_seg -= seg.dur
+            self._iseg += 1
+            if self._iseg >= len(self._segs):
+                self._segs, self._iseg = self._montar_ciclo(), 0
+            seg = self._segs[self._iseg]
+        self._desenhar_seg(seg, self._t_seg)
+
+    def _desenhar_seg(self, seg: _Seg, t: float) -> None:
+        if seg.tipo == "oculto":
+            if self._gato_visivel:
+                self.itemconfigure(self._i_gato, state="hidden")
+                self._gato_visivel = False
+            self._mostrar_grr(None, t)
+            return
+        dc = DC * self.k
+        if seg.tipo == "andar":
+            dist = _curva(seg.curva, t / seg.dur) * (seg.x1 - seg.x0)
+            x = seg.x0 + dist
+            clip, idx = "andar", int(((dist / dc) % 1.0) * NW) % NW   # pernas sincronizadas com o chão
+        elif seg.tipo == "segurar":
+            x, clip = seg.x0, seg.clip
+            idx = len(self._quadros[clip]) - 1
+        else:
+            x, clip = seg.x0, seg.clip
+            n = len(self._quadros[clip])
+            periodo = n / FPS_CLIP
+            idx = min(n - 1, int(((t % periodo) / periodo) * n))
+        if (clip, idx) != self._frame_atual:
+            self._frame_atual = (clip, idx)
+            self._foto_gato.paste(decodificar(self._quadros[clip][idx], self._tam_gato))
+        if not self._gato_visivel:
+            self.itemconfigure(self._i_gato, state="normal")
+            self._gato_visivel = True
+        if abs(x - self._x) > 0.05:
+            self._x = x
+            self.coords(self._i_gato, x, self._y_gato)
+        self._mostrar_grr(seg, t)
+
+    def _mostrar_grr(self, seg, t: float) -> None:
+        if seg is None or not seg.grr:
+            if self._grr_visivel:
+                self.itemconfigure(self._i_grr, state="hidden")
+                self._grr_visivel = False
+            return
+        env = max(0.0, min(1.0, t / 0.35, (seg.dur - t) / 0.35))
+        palavra = ("grr", "grrr", "grrrr!")[int(t * 3.2) % 3]
+        vibra = self.k * 1.4
+        x = self._x + 298 * self.k + random.uniform(-vibra, vibra)
+        y = self._y_gato + 122 * self.k + random.uniform(-vibra, vibra)
+        self.coords(self._i_grr, x, y)
+        self.itemconfigure(self._i_grr, text=palavra, fill=_lerp_hex(T.PAREDE_BASE, T.CREME, env),
+                           state="normal")
+        self._grr_visivel = True
+
+    # ------------------------------------------------------------ ciclo de vida
+    def _timer_preciso(self, ligar: bool) -> None:
+        """No Windows o `after` tem passo de ~15 ms; pedir 1 ms deixa o movimento mais regular."""
+        if sys.platform != "win32" or ligar == self._timer_alto:
+            return
+        try:
+            winmm = ctypes.windll.winmm
+            (winmm.timeBeginPeriod if ligar else winmm.timeEndPeriod)(1)
+            self._timer_alto = ligar
+        except (AttributeError, OSError):
+            pass
+
+    def parar(self) -> None:
+        for nome in ("_after_tick", "_after_fundo", "_after_espera"):
+            id_ = getattr(self, nome)
+            if id_ is not None:
+                try:
+                    self.after_cancel(id_)
+                except tk.TclError:
+                    pass
+                setattr(self, nome, None)
+        self._timer_preciso(False)
+
+    def destroy(self) -> None:
+        self.parar()
+        super().destroy()
+
+
+# ==================== ui/overlay_captura.py ====================
+
+class OverlayCaptura:
+    def __init__(self, root: tk.Misc, ao_capturar: Callable[[Image.Image, int], None], ao_cancelar: Callable[[], None]):
+        self.root = root
+        self.ao_capturar = ao_capturar
+        self.ao_cancelar = ao_cancelar
+        self.monitor_virtual: dict
+        self.monitores: list[dict]
+        with mss.MSS() as sct:
+            self.monitores = list(sct.monitors[1:])
+            if not self.monitores:
+                raise RuntimeError("Nenhum monitor disponível para captura.")
+            self.monitor_virtual = dict(sct.monitors[0])
+            shot = sct.grab(self.monitor_virtual)
+            self.imagem = Image.frombytes("RGB", shot.size, shot.rgb)
+
+        self.inicio: tuple[int, int] | None = None
+        self.retangulo: int | None = None
+        self.mira_h: int | None = None
+        self.mira_v: int | None = None
+        self.janela = tk.Toplevel(root)
+        self.janela.title("Capturar alvo")
+        self.janela.configure(bg=T.ESPRESSO, cursor="crosshair")
+        self.janela.attributes("-topmost", True)
+        try:
+            self.janela.attributes("-alpha", 0.60)
+        except tk.TclError:
+            pass
+        self.janela.overrideredirect(True)
+        x = self.monitor_virtual["left"]
+        y = self.monitor_virtual["top"]
+        largura = self.monitor_virtual["width"]
+        altura = self.monitor_virtual["height"]
+        if sys.platform == "win32":
+            self.janela.geometry(f"{largura}x{altura}+0+0")
+            self.janela.update_idletasks()
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_bool
+            user32.SetWindowPos(
+                ctypes.c_void_p(self.janela.winfo_id()), ctypes.c_void_p(-1),
+                int(x), int(y), int(largura), int(altura), 0x0040,
+            )
+        else:
+            self.janela.geometry(f"{largura}x{altura}{x:+d}{y:+d}")
+        self.canvas = tk.Canvas(self.janela, bg=T.ESPRESSO, highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.create_text(
+            28, 28, anchor="nw", text="Arraste sobre o que o gato deve procurar.  Esc cancela.",
+            fill=T.CARAMELO, font=fonte(root, 14, "bold"),
+        )
+        self.canvas.bind("<Motion>", self._mover)
+        self.canvas.bind("<ButtonPress-1>", self._iniciar)
+        self.canvas.bind("<B1-Motion>", self._arrastar)
+        self.canvas.bind("<ButtonRelease-1>", self._soltar)
+        self.janela.bind("<Escape>", self.cancelar)
+        self.janela.focus_force()
+
+    def _mover(self, evento) -> None:
+        x, y = evento.x, evento.y
+        largura = self.monitor_virtual["width"]
+        altura = self.monitor_virtual["height"]
+        if self.mira_h is not None:
+            self.canvas.delete(self.mira_h)
+            self.canvas.delete(self.mira_v)
+        self.mira_h = self.canvas.create_line(0, y, largura, y, fill=T.CARAMELO, width=1)
+        self.mira_v = self.canvas.create_line(x, 0, x, altura, fill=T.CARAMELO, width=1)
+        if self.retangulo is not None:
+            self.canvas.tag_raise(self.retangulo)
+
+    def _iniciar(self, evento) -> None:
+        self.inicio = (evento.x, evento.y)
+        if self.retangulo is not None:
+            self.canvas.delete(self.retangulo)
+        self.retangulo = self.canvas.create_rectangle(
+            evento.x, evento.y, evento.x, evento.y,
+            outline=T.CARAMELO, width=2, fill=T.CARAMELO, stipple="gray25",
+        )
+
+    def _arrastar(self, evento) -> None:
+        if self.inicio is not None and self.retangulo is not None:
+            self.canvas.coords(self.retangulo, *self.inicio, evento.x, evento.y)
+
+    def _soltar(self, evento) -> None:
+        if self.inicio is None:
+            return
+        x1, x2 = sorted((self.inicio[0], evento.x))
+        y1, y2 = sorted((self.inicio[1], evento.y))
+        if x2 - x1 < 3 or y2 - y1 < 3:
+            return
+        recorte = self.imagem.crop((x1, y1, x2, y2))
+        centro_x = self.monitor_virtual["left"] + (x1 + x2) // 2
+        centro_y = self.monitor_virtual["top"] + (y1 + y2) // 2
+        monitor_id = 1
+        for indice, monitor in enumerate(self.monitores, start=1):
+            if (monitor["left"] <= centro_x < monitor["left"] + monitor["width"]
+                    and monitor["top"] <= centro_y < monitor["top"] + monitor["height"]):
+                monitor_id = indice
+                break
+        self.janela.destroy()
+        self.ao_capturar(recorte, monitor_id)
+
+    def cancelar(self, _evento=None) -> None:
+        if self.janela.winfo_exists():
+            self.janela.destroy()
+        self.ao_cancelar()
+
+
+# ==================== ui/janela.py ====================
+
+class JanelaHunterCat(ctk.CTk):
+    def __init__(self):
+        ctk.set_appearance_mode("Dark")
+        super().__init__(fg_color=T.PAREDE_BASE)
+        self.raiz_dados = Path(__file__).resolve().parent
+        self.repositorio = RepositorioPerfis(self.raiz_dados)
+        self.eventos: queue.Queue = queue.Queue()
+        self.config_path = self.raiz_dados / "configuracoes.json"
+        self.cfg = self._ler_config()
+        self.executor = Executor(
+            self.raiz_dados, self.eventos,
+            restringir_monitor=self.cfg["restringir_monitor"],
+        )
+        self.perfis = self.repositorio.listar()
+        if not self.perfis:
+            self.repositorio.salvar(Perfil("padrao"))
+            self.perfis = ["padrao"]
+        self.perfil_atual = self.repositorio.carregar(self.perfis[0])
+        self.indice_selecionado: int | None = None
+        self.modo, self.ciclos = self.perfil_atual.modo, self.perfil_atual.ciclos
+        self.inicio_ativo = None
+        self.ciclo_atual, self.status_atual = 0, "ocioso"
+        self.minimizado_por_execucao = False
+        self.minimizado_por_teste = False
+        self.overlay: OverlayCaptura | None = None
+        self._preview_ref = None
+        self.esc = self._detectar_escala()
+
+        self.acao_var = ctk.StringVar(value=ROTULOS_ACAO["clique"])
+        self.modo_var = ctk.StringVar(value=self._rotulo_modo(self.modo))
+        self.ciclos_var = ctk.StringVar(value=str(self.ciclos))
+        self.confianca_var = ctk.DoubleVar(value=0.85)
+        self.humano_var = ctk.BooleanVar(value=False)
+        self.delay_var = ctk.StringVar(value="450")
+        self.tentativas_var = ctk.StringVar(value="5")
+        self.intervalo_var = ctk.StringVar(value="400")
+        self.scroll_var = ctk.StringVar(value="500")
+        self.sensivel_var = ctk.BooleanVar(value=False)
+        self.destino_var = ctk.StringVar(value="")
+
+        self._montar_janela()
+        self.cena = Cena(self, self.esc)
+        self._montar_interface()
+        self._atualizar_perfis()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+        self._atualizar_status()
+        self._emitir_avisos_perfis()
+        self.after(80, self._consumir_eventos)
+        self.protocol("WM_DELETE_WINDOW", self._fechar)
+        self.bind_all("<Escape>", lambda _e: self._parar())
+        self.bind_all("<F12>", lambda _e: self._parar())
+
+    # ------------------------------------------------------------ base
+    def _detectar_escala(self) -> float:
+        for obter in (lambda: self._get_window_scaling(), lambda: ctk.ScalingTracker.get_window_scaling(self)):
+            try:
+                valor = float(obter())
+                if valor > 0:
+                    return valor
+            except Exception:
+                continue
+        try:
+            return max(1.0, self.winfo_fpixels("1i") / 96.0)
+        except tk.TclError:
+            return 1.0
+
+    def _ler_config(self):
+        padrao = {"restringir_monitor": False, "bip": False, "minimizar_ao_executar": True}
+        try:
+            dados = json.loads(self.config_path.read_text(encoding="utf-8"))
+            if isinstance(dados, dict):
+                padrao.update({k: dados[k] for k in padrao if k in dados})
+        except (OSError, ValueError, TypeError):
+            pass
+        return padrao
+
+    def _salvar_config(self):
+        tmp = self.config_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.config_path)
+
+    @staticmethod
+    def _rotulo_modo(modo):
+        return {"loop": "Contínuo", "ciclos": "Ciclos"}.get(modo, "Simples")
+
+    def _montar_janela(self):
+        self.title("Hunter Cat")
+        self.geometry("1440x900")
+        self.minsize(1120, 720)
+        if sys.platform == "win32":
+            self.after(80, self._maximizar)
+
+    def _maximizar(self):
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------ layout
+    def _montar_interface(self):
+        e = self.esc
+        self.grid_columnconfigure(0, weight=0, minsize=int(252 * e))
+        self.grid_columnconfigure(1, weight=1, minsize=int(440 * e))
+        self.grid_columnconfigure(2, weight=0, minsize=int(392 * e))
+        self.grid_rowconfigure(0, weight=0, minsize=int(100 * e))   # cabeçalho (desenhado na cena)
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=0, minsize=int(214 * e))   # palco do gato (desenhado na cena)
+        self._topo()
+        self._coluna_perfis()
+        self._coluna_centro()
+        self._coluna_ajustes()
+
+    def _topo(self):
+        chip = ctk.CTkFrame(self, fg_color=T.PAINEL, border_color=T.BORDA, border_width=1, corner_radius=20)
+        chip.grid(row=0, column=1, sticky="se", padx=(0, 8), pady=(0, 18))
+        self.status_label = rotulo(chip, "●  Pronto", cor=T.SUAVE, tamanho=13, peso="bold")
+        self.status_label.pack(padx=18, pady=7)
+        botao(self, "Configurações", self._abrir_configuracoes, estilo="suave", width=150, height=38,
+              corner_radius=19).grid(row=0, column=2, sticky="se", padx=(8, 16), pady=(0, 18))
+
+    def _coluna_perfis(self):
+        self.col_esquerda = cartao(self, raio=22)
+        self.col_esquerda.grid(row=1, column=0, sticky="nsew", padx=(16, 8), pady=(0, 10))
+        self.col_esquerda.grid_columnconfigure(0, weight=1)
+        self.col_esquerda.grid_rowconfigure(1, weight=1)
+
+        topo = ctk.CTkFrame(self.col_esquerda, fg_color="transparent")
+        topo.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        topo.grid_columnconfigure(0, weight=1)
+        rotulo(topo, "Perfis", tamanho=20, peso="bold", titulo=True).grid(row=0, column=0, sticky="w")
+        botao(topo, "+ Novo", self._novo_perfil, estilo="primario", width=76, height=30,
+              corner_radius=15, font=fonte(self, 12, "bold")).grid(row=0, column=1, sticky="e")
+        self.contagem_perfis = rotulo(topo, "", cor=T.APAGADO, tamanho=12)
+        self.contagem_perfis.grid(row=1, column=0, columnspan=2, sticky="w")
+
+        self.lista_perfis = ctk.CTkScrollableFrame(
+            self.col_esquerda, fg_color=T.CAMPO, corner_radius=14,
+            scrollbar_button_color=T.BORDA, scrollbar_button_hover_color=T.CARAMELO_ESC,
+        )
+        self.lista_perfis.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 8))
+        self.lista_perfis.grid_columnconfigure(0, weight=1)
+
+        rotulo(self.col_esquerda, "Esc ou F12 interrompem a execução a qualquer momento.",
+               cor=T.APAGADO, tamanho=11, wraplength=int(210 * self.esc), justify="left").grid(
+            row=2, column=0, sticky="ew", padx=16, pady=(2, 14))
+
+    def _coluna_centro(self):
+        centro = ctk.CTkFrame(self, fg_color="transparent")
+        centro.grid(row=1, column=1, sticky="nsew", padx=8, pady=(0, 10))
+        centro.grid_columnconfigure(0, weight=1)
+        centro.grid_rowconfigure(1, weight=1)
+        self._painel_comandos(centro)
+        self._painel_fila(centro)
+        self._painel_diario(centro)
+
+    def _painel_comandos(self, pai):
+        cmd = cartao(pai, raio=22)
+        cmd.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        cmd.grid_columnconfigure(0, weight=3, uniform="cmd")
+        cmd.grid_columnconfigure(1, weight=2, uniform="cmd")
+        cmd.grid_columnconfigure(2, weight=2, uniform="cmd")
+        botao(cmd, "▶  Executar", self._executar, estilo="primario", height=50, corner_radius=25,
+              font=fonte(self, 15, "bold")).grid(row=0, column=0, sticky="ew", padx=(16, 6), pady=(16, 10))
+        botao(cmd, "■  Parar", self._parar, estilo="perigo", height=50, corner_radius=25,
+              font=fonte(self, 14, "bold")).grid(row=0, column=1, sticky="ew", padx=6, pady=(16, 10))
+        botao(cmd, "↻  Reiniciar", self._resetar, estilo="suave", height=50, corner_radius=25,
+              font=fonte(self, 14)).grid(row=0, column=2, sticky="ew", padx=(6, 16), pady=(16, 10))
+
+        linha = ctk.CTkFrame(cmd, fg_color="transparent")
+        linha.grid(row=1, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 16))
+        linha.grid_columnconfigure(1, weight=1)
+        rotulo(linha, "Repetição", cor=T.SUAVE, tamanho=12).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.modo_menu = ctk.CTkSegmentedButton(
+            linha, values=["Simples", "Contínuo", "Ciclos"], variable=self.modo_var,
+            command=self._modo_alterado, height=34, corner_radius=17,
+            fg_color=T.CAMPO, selected_color=T.CARAMELO, selected_hover_color=T.CARAMELO_ESC,
+            unselected_color=T.CAMPO, unselected_hover_color=T.CARTAO_HOVER,
+            text_color=T.TEXTO, font=fonte(self, 12),
+        )
+        self.modo_menu.grid(row=0, column=1, sticky="ew")
+        rotulo(linha, "Ciclos", cor=T.SUAVE, tamanho=12).grid(row=0, column=2, sticky="e", padx=(14, 6))
+        self.ciclos_entry = entrada(linha, largura=64, textvariable=self.ciclos_var, height=34, justify="center")
+        self.ciclos_entry.grid(row=0, column=3, sticky="e")
+        self.ciclos_entry.bind("<FocusOut>", lambda _e: self._salvar_modo())
+        self.ciclos_entry.bind("<Return>", lambda _e: self._salvar_modo())
+
+    def _painel_fila(self, pai):
+        fila = cartao(pai, raio=22)
+        fila.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+        fila.grid_columnconfigure(0, weight=1)
+        fila.grid_rowconfigure(1, weight=1)
+
+        topo = ctk.CTkFrame(fila, fg_color="transparent")
+        topo.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
+        topo.grid_columnconfigure(0, weight=1)
+        titulos = ctk.CTkFrame(topo, fg_color="transparent")
+        titulos.grid(row=0, column=0, sticky="w")
+        rotulo(titulos, "Fila de alvos", tamanho=20, peso="bold", titulo=True).pack(anchor="w")
+        self.contagem_alvos = rotulo(titulos, "0 alvos", cor=T.APAGADO, tamanho=12)
+        self.contagem_alvos.pack(anchor="w")
+        botao(topo, "＋  Capturar alvo", self._capturar, estilo="primario", height=40, corner_radius=20,
+              font=fonte(self, 13, "bold")).grid(row=0, column=1, sticky="e")
+
+        self.lista_fila = ctk.CTkScrollableFrame(
+            fila, fg_color=T.CAMPO, corner_radius=14,
+            scrollbar_button_color=T.BORDA, scrollbar_button_hover_color=T.CARAMELO_ESC,
+        )
+        self.lista_fila.grid(row=1, column=0, sticky="nsew", padx=10, pady=4)
+        self.lista_fila.grid_columnconfigure(0, weight=1)
+
+        rodape = ctk.CTkFrame(fila, fg_color="transparent")
+        rodape.grid(row=2, column=0, sticky="ew", padx=10, pady=(6, 12))
+        for coluna in range(3):
+            rodape.grid_columnconfigure(coluna, weight=1, uniform="mover")
+        botao(rodape, "↑  Subir", lambda: self._mover_alvo(-1), estilo="suave", height=34).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+        botao(rodape, "↓  Descer", lambda: self._mover_alvo(1), estilo="suave", height=34).grid(
+            row=0, column=1, sticky="ew", padx=4)
+        botao(rodape, "Remover", self._remover_alvo, estilo="perigo", height=34).grid(
+            row=0, column=2, sticky="ew", padx=(4, 0))
+
+    def _painel_diario(self, pai):
+        diario = cartao(pai, raio=22, height=150)
+        diario.grid(row=2, column=0, sticky="ew")
+        diario.grid_columnconfigure(0, weight=1)
+        diario.grid_propagate(False)
+        rotulo(diario, "Diário do gato", tamanho=15, peso="bold", titulo=True).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(10, 2))
+        self.log = ctk.CTkTextbox(
+            diario, fg_color=T.CAMPO, text_color=T.TEXTO, border_width=0, corner_radius=12,
+            font=fonte(self, 12), wrap="word",
+            scrollbar_button_color=T.BORDA, scrollbar_button_hover_color=T.CARAMELO_ESC,
+        )
+        self.log.grid(row=1, column=0, sticky="nsew", padx=10, pady=(2, 10))
+        diario.grid_rowconfigure(1, weight=1)
+        for tag, cor_tag in (("ok", T.SALVIA), ("erro", T.TERRACOTA), ("info", T.TEXTO), ("tempo", T.APAGADO)):
+            self.log.tag_config(tag, foreground=cor_tag)
+        self.log.configure(state="disabled")
+
+    def _coluna_ajustes(self):
+        self.col_direita = cartao(self, raio=22)
+        self.col_direita.grid(row=1, column=2, sticky="nsew", padx=(8, 16), pady=(0, 10))
+        self.col_direita.grid_columnconfigure(0, weight=1)
+        self.col_direita.grid_rowconfigure(1, weight=1)
+        rotulo(self.col_direita, "Ajustes do alvo", tamanho=20, peso="bold", titulo=True).grid(
+            row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
+        self.placeholder = rotulo(
+            self.col_direita, "Escolha um alvo na fila\npara ajustar o que o gato faz com ele.",
+            cor=T.APAGADO, tamanho=13, justify="center", anchor="center",
+        )
+        self.placeholder.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        self.editor = ctk.CTkScrollableFrame(
+            self.col_direita, fg_color=T.PAINEL, corner_radius=14,
+            scrollbar_button_color=T.BORDA, scrollbar_button_hover_color=T.CARAMELO_ESC,
+        )
+        self.editor.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 10))
+        self.editor.grid_remove()
+        self.editor.grid_columnconfigure((0, 1), weight=1, uniform="edit")
+
+        self.preview_box = ctk.CTkFrame(self.editor, fg_color=T.CAMPO, corner_radius=14, height=150)
+        self.preview_box.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 10))
+        self.preview_box.grid_propagate(False)
+        self.preview = rotulo(self.preview_box, "Imagem do alvo", cor=T.APAGADO, tamanho=12,
+                              anchor="center", justify="center")
+        self.preview.pack(fill="both", expand=True)
+
+        rotulo(self.editor, "O que fazer", cor=T.SUAVE, tamanho=12).grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 2))
+        self.acao_menu = ctk.CTkOptionMenu(
+            self.editor, values=[ROTULOS_ACAO[a] for a in ACOES],
+            variable=self.acao_var, command=self._acao_alterada,
+            fg_color=T.CAMPO, button_color=T.CARTAO, button_hover_color=T.CARAMELO_ESC,
+            text_color=T.TEXTO, dropdown_fg_color=T.PAINEL, dropdown_text_color=T.TEXTO,
+            dropdown_hover_color=T.CARTAO_HOVER, corner_radius=10, font=fonte(self, 12), height=38,
+        )
+        self.acao_menu.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 8))
+
+        self.rotulo_texto = rotulo(self.editor, "Texto a digitar", cor=T.SUAVE, tamanho=12)
+        self.rotulo_texto.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(2, 2))
+        self.campo_texto = entrada(self.editor, height=38)
+        self.campo_texto.grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+
+        self.humano_check = self._check(self.editor, "Digitar como uma pessoa", self.humano_var,
+                                        self._salvar_edicao)
+        self.humano_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        self.sensivel_check = self._check(self.editor, "É uma senha (fica guardada com segurança)",
+                                          self.sensivel_var, self._sensivel_alterado)
+        self.sensivel_check.grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        self.rotulo_destinos = rotulo(self.editor, "Só digitar em janelas com este título ou domínio",
+                                      cor=T.SUAVE, tamanho=12, wraplength=int(320 * self.esc), justify="left")
+        self.rotulo_destinos.grid(row=7, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 2))
+        self.destino_entry = entrada(self.editor, textvariable=self.destino_var,
+                                     placeholder_text="exemplo.com", height=38)
+        self.destino_entry.grid(row=8, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.destino_entry.bind("<FocusOut>", lambda _e: self._salvar_edicao())
+
+        rotulo(self.editor, "Ritmo", cor=T.CARAMELO, tamanho=14, peso="bold", titulo=True).grid(
+            row=9, column=0, columnspan=2, sticky="ew", padx=8, pady=(12, 0))
+        self._campo_numerico(self.editor, "Espera depois (ms)", self.delay_var, 10, 0)
+        self._campo_numerico(self.editor, "Tentativas", self.tentativas_var, 10, 1)
+        self._campo_numerico(self.editor, "Intervalo (ms)", self.intervalo_var, 11, 0)
+        self._campo_numerico(self.editor, "Rolagem (px, negativo desce)", self.scroll_var, 11, 1)
+
+        cab_prec = ctk.CTkFrame(self.editor, fg_color="transparent")
+        cab_prec.grid(row=12, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
+        cab_prec.grid_columnconfigure(0, weight=1)
+        rotulo(cab_prec, "Precisão mínima", cor=T.SUAVE, tamanho=12).grid(row=0, column=0, sticky="w")
+        self.confianca_num = rotulo(cab_prec, "0.85", cor=T.CARAMELO, tamanho=13, peso="bold")
+        self.confianca_num.grid(row=0, column=1, sticky="e")
+        self.confianca_slider = ctk.CTkSlider(
+            self.editor, from_=0.5, to=0.99, number_of_steps=49,
+            variable=self.confianca_var, command=self._conf_alterada,
+            fg_color=T.CAMPO, progress_color=T.CARAMELO,
+            button_color=T.CARAMELO, button_hover_color=T.CARAMELO_ESC,
+        )
+        self.confianca_slider.grid(row=13, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10))
+        self.confianca_slider.bind("<ButtonRelease-1>", self._salvar_edicao, add="+")
+
+        botao(self.editor, "Salvar ajustes", self._salvar_edicao, estilo="primario", height=42,
+              corner_radius=21, font=fonte(self, 13, "bold")).grid(
+            row=14, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 6))
+        botao(self.editor, "Testar", self._testar_alvo, height=38).grid(
+            row=15, column=0, sticky="ew", padx=(6, 3), pady=3)
+        botao(self.editor, "Duplicar", self._duplicar_alvo, height=38).grid(
+            row=15, column=1, sticky="ew", padx=(3, 6), pady=3)
+        botao(self.editor, "Excluir alvo", self._remover_alvo, estilo="perigo", height=38).grid(
+            row=16, column=0, columnspan=2, sticky="ew", padx=6, pady=(3, 8))
+
+    def _check(self, pai, texto, variavel, comando):
+        return ctk.CTkCheckBox(
+            pai, text=texto, variable=variavel, command=comando,
+            fg_color=T.CARAMELO, hover_color=T.CARAMELO_ESC, border_color=T.BORDA,
+            checkmark_color=T.ESPRESSO, text_color=T.TEXTO, corner_radius=6, font=fonte(self, 12),
+        )
+
+    def _campo_numerico(self, pai, titulo, var, row, col):
+        grupo = ctk.CTkFrame(pai, fg_color="transparent")
+        grupo.grid(row=row, column=col, sticky="ew", padx=4, pady=4)
+        grupo.grid_columnconfigure(0, weight=1)
+        rotulo(grupo, titulo, cor=T.SUAVE, tamanho=11, wraplength=int(150 * self.esc), justify="left").grid(
+            row=0, column=0, sticky="w")
+        campo = entrada(grupo, textvariable=var, height=36)
+        campo.grid(row=1, column=0, sticky="ew")
+        campo.bind("<FocusOut>", lambda _e: self._salvar_edicao())
+        campo.bind("<Return>", lambda _e: self._salvar_edicao())
+
+    # ------------------------------------------------------------ listas
+    def _atualizar_perfis(self):
+        for w in self.lista_perfis.winfo_children():
+            w.destroy()
+        for linha, nome in enumerate(self.perfis):
+            ativo = nome == self.perfil_atual.nome
+            botao_perfil = ctk.CTkButton(
+                self.lista_perfis, text=nome, anchor="w",
+                command=lambda n=nome: self._trocar_perfil(n),
+                fg_color=T.CARTAO_HOVER if ativo else "transparent",
+                hover_color=T.CARTAO, text_color=T.CARAMELO if ativo else T.TEXTO,
+                border_width=1 if ativo else 0, border_color=T.CARAMELO,
+                corner_radius=12, height=40, font=fonte(self, 13, "bold" if ativo else "normal"),
+            )
+            botao_perfil.grid(row=linha, column=0, sticky="ew", padx=3, pady=3)
+        total = len(self.perfis)
+        self.contagem_perfis.configure(text=f"{total} {'perfil' if total == 1 else 'perfis'}")
+
+    def _renderizar_fila(self):
+        for w in self.lista_fila.winfo_children():
+            w.destroy()
+        alvos = self.perfil_atual.alvos
+        if not alvos:
+            rotulo(self.lista_fila,
+                   "Nenhum alvo ainda.\nUse Capturar alvo e arraste sobre o botão, o campo ou o ícone "
+                   "que o gato deve procurar na tela.",
+                   cor=T.APAGADO, tamanho=13, justify="left", wraplength=int(330 * self.esc)).pack(
+                fill="x", padx=14, pady=18)
+        for i, alvo in enumerate(alvos):
+            ativo = i == self.indice_selecionado
+            card = ctk.CTkFrame(
+                self.lista_fila,
+                fg_color=T.CARTAO_HOVER if ativo else T.CARTAO,
+                border_color=T.CARAMELO if ativo else T.BORDA,
+                border_width=2 if ativo else 1, corner_radius=14,
+            )
+            card.pack(fill="x", padx=4, pady=4)
+            card.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                card, text=str(i + 1), width=36, height=36, corner_radius=18,
+                fg_color=T.CARAMELO if ativo else T.BORDA,
+                text_color=T.ESPRESSO if ativo else T.TEXTO,
+                font=fonte(self, 14, "bold"),
+            ).grid(row=0, column=0, rowspan=2, padx=(12, 10), pady=12)
+            rotulo(card, alvo.nome, cor=T.CARAMELO if ativo else T.TEXTO, tamanho=14, peso="bold").grid(
+                row=0, column=1, sticky="ew", padx=(0, 12), pady=(10, 0))
+            rotulo(card, f"{ROTULOS_ACAO.get(alvo.acao, alvo.acao)}, espera de {alvo.delay_ms} ms",
+                   cor=T.SUAVE, tamanho=12).grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(0, 10))
+            for w in (card, *card.winfo_children()):
+                w.bind("<Button-1>", lambda _e, n=i: self._selecionar_alvo(n))
+        n = len(alvos)
+        self.contagem_alvos.configure(text=f"{n} {'alvo' if n == 1 else 'alvos'} em ordem de execução")
+        self._atualizar_status()
+
+    # ------------------------------------------------------------ editor do alvo
+    def _atualizar_inspecao(self):
+        alvo = self._alvo_selecionado()
+        if not alvo:
+            self.editor.grid_remove()
+            self.placeholder.grid()
+            self.acao_var.set(ROTULOS_ACAO["clique"])
+            self.campo_texto.delete(0, "end")
+            self.delay_var.set("450")
+            self.confianca_var.set(0.85)
+            self.confianca_num.configure(text="0.85")
+            self.tentativas_var.set("5")
+            self.intervalo_var.set("400")
+            self.scroll_var.set("500")
+            self.humano_var.set(False)
+            self.sensivel_var.set(False)
+            self.destino_var.set("")
+            return
+        self.placeholder.grid_remove()
+        self.editor.grid()
+        imagem = carregar_preview(self.raiz_dados, alvo, limite=(340, 130))
+        if imagem:
+            ref = ctk.CTkImage(light_image=imagem, dark_image=imagem, size=imagem.size)
+            self.preview.configure(image=ref, text="")
+            self._preview_ref = ref
+        else:
+            self._limpar_preview("Imagem do alvo não encontrada")
+        self.acao_var.set(ROTULOS_ACAO.get(alvo.acao, ROTULOS_ACAO["clique"]))
+        self.campo_texto.delete(0, "end")
+        self.campo_texto.insert(0, alvo.texto if alvo.acao == "digitar" else alvo.tecla)
+        self.sensivel_var.set(alvo.sensivel)
+        self.destino_var.set(", ".join(alvo.destinos_permitidos))
+        self.campo_texto.configure(show="*" if alvo.sensivel else "")
+        self.delay_var.set(str(alvo.delay_ms))
+        self.confianca_var.set(alvo.confianca)
+        self.confianca_num.configure(text=f"{alvo.confianca:.2f}")
+        self.tentativas_var.set(str(alvo.tentativas))
+        self.intervalo_var.set(str(alvo.intervalo_tentativa_ms))
+        self.scroll_var.set(str(alvo.scroll_pixels))
+        self.humano_var.set(alvo.digitar_humano)
+        self._acao_alterada(self.acao_var.get(), salvar=False)
+
+    def _limpar_preview(self, texto):
+        interno = getattr(self.preview, "_label", None)
+        if interno:
+            interno.configure(image="")
+        self.preview.configure(image=None, text=texto)
+        self._preview_ref = None
+
+    def _acao_alterada(self, rotulo_acao, salvar=True):
+        acao = CODIGOS_ACAO.get(rotulo_acao, "clique")
+        if acao in {"digitar", "tecla"}:
+            self.rotulo_texto.configure(text="Texto a digitar" if acao == "digitar" else "Tecla ou combinação (ex.: ctrl+s)")
+            self.rotulo_texto.grid()
+            self.campo_texto.grid()
+        else:
+            self.rotulo_texto.grid_remove()
+            self.campo_texto.grid_remove()
+        for w in (self.humano_check, self.sensivel_check, self.rotulo_destinos, self.destino_entry):
+            if acao == "digitar":
+                w.grid()
+            else:
+                w.grid_remove()
+        if salvar:
+            self._salvar_edicao()
+
+    def _sensivel_alterado(self):
+        self.campo_texto.configure(show="*" if self.sensivel_var.get() else "")
+        self._salvar_edicao()
+
+    def _conf_alterada(self, valor):
+        self.confianca_num.configure(text=f"{float(valor):.2f}")
+
+    def _salvar_edicao(self, _evento=None):
+        alvo = self._alvo_selecionado()
+        if not alvo:
+            return
+        try:
+            alvo.delay_ms = max(0, int(self.delay_var.get() or 0))
+            alvo.tentativas = max(1, int(self.tentativas_var.get() or 5))
+            alvo.intervalo_tentativa_ms = max(0, int(self.intervalo_var.get() or 400))
+            alvo.scroll_pixels = int(self.scroll_var.get() or 500)
+            alvo.confianca = min(0.99, max(0.50, float(self.confianca_var.get())))
+        except ValueError:
+            return
+        alvo.acao = CODIGOS_ACAO.get(self.acao_var.get(), "clique")
+        valor = self.campo_texto.get()
+        if alvo.acao == "digitar":
+            alvo.sensivel = bool(self.sensivel_var.get())
+            alvo.destinos_permitidos = [x.strip() for x in re.split(r"[,;\n]+", self.destino_var.get()) if x.strip()]
+            if alvo.sensivel:
+                ref = _PADRAO_SEGREDO.fullmatch(valor.strip())
+                if ref:
+                    alvo.texto = valor.strip()
+                elif valor:
+                    nome = f"alvo_{alvo.id}"
+                    try:
+                        guardar_segredo(nome, valor)
+                    except (RuntimeError, OSError, ValueError) as erro:
+                        self._log_local("erro", f"senha não salva: {erro}")
+                        return
+                    alvo.texto = f"{{{{segredo:{nome}}}}}"
+                    self.campo_texto.delete(0, "end")
+                    self.campo_texto.insert(0, alvo.texto)
+                else:
+                    alvo.texto = ""
+            else:
+                alvo.texto = valor
+        elif alvo.acao == "tecla":
+            alvo.tecla = valor or "enter"
+        alvo.digitar_humano = bool(self.humano_var.get())
+        try:
+            salvar_metadados(alvo, (self.raiz_dados / alvo.arquivo).with_suffix(".json"))
+        except OSError as erro:
+            self._log_local("erro", f"não foi possível salvar o alvo: {erro}")
+        self._salvar_perfil()
+        self._renderizar_fila()
+
+    def _modo_alterado(self, valor):
+        self.modo = {"Contínuo": "loop", "Ciclos": "ciclos"}.get(valor, "simples")
+        self._salvar_perfil()
+
+    # ------------------------------------------------------------ diálogos
+    def _dialogo(self, titulo, largura, altura):
+        e = self.esc
+        jan = ctk.CTkToplevel(self)
+        jan.title(titulo)
+        jan.configure(fg_color=T.PAREDE_BASE)
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() - int(largura * e)) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - int(altura * e)) // 3
+            jan.geometry(f"{largura}x{altura}+{max(0, x)}+{max(0, y)}")
+        except tk.TclError:
+            jan.geometry(f"{largura}x{altura}")
+        jan.resizable(False, False)
+        jan.transient(self)
+        jan.after(150, lambda: self._focar(jan))
+        caixa = cartao(jan, raio=20)
+        caixa.pack(fill="both", expand=True, padx=10, pady=10)
+        return jan, caixa
+
+    @staticmethod
+    def _focar(jan):
+        try:
+            if jan.winfo_exists():
+                jan.grab_set()
+                jan.focus_force()
+        except tk.TclError:
+            pass
+
+    def _abrir_configuracoes(self):
+        janela, box = self._dialogo("Configurações", 470, 300)
+        rotulo(box, "Configurações", tamanho=20, peso="bold", titulo=True).pack(anchor="w", padx=18, pady=(16, 8))
+        variaveis = {k: ctk.BooleanVar(value=self.cfg[k]) for k in ("restringir_monitor", "bip", "minimizar_ao_executar")}
+        textos = (
+            ("restringir_monitor", "Procurar só no monitor onde o alvo foi capturado"),
+            ("bip", "Tocar um bip ao iniciar"),
+            ("minimizar_ao_executar", "Minimizar a janela enquanto executa"),
+        )
+        for chave, texto in textos:
+            self._check(box, texto, variaveis[chave], None).pack(anchor="w", padx=20, pady=8)
+
+        def salvar():
+            self.cfg = {k: bool(v.get()) for k, v in variaveis.items()}
+            self._salvar_config()
+            self.executor.restringir_monitor = self.cfg["restringir_monitor"]
+            janela.destroy()
+
+        botao(box, "Aplicar", salvar, estilo="primario", height=42, corner_radius=21).pack(
+            fill="x", padx=18, pady=(14, 16))
+
+    def _confirmar_acao(self, titulo, mensagem, callback, rotulo_botao):
+        w, box = self._dialogo(titulo, 440, 200)
+        rotulo(box, titulo, tamanho=18, peso="bold", titulo=True).pack(anchor="w", padx=18, pady=(16, 6))
+        rotulo(box, mensagem, cor=T.SUAVE, tamanho=13, wraplength=int(390 * self.esc), justify="left").pack(
+            fill="x", padx=18)
+        acoes = ctk.CTkFrame(box, fg_color="transparent")
+        acoes.pack(fill="x", padx=18, pady=16, side="bottom")
+
+        def confirmar():
+            w.destroy()
+            callback()
+
+        botao(acoes, "Cancelar", w.destroy, width=110).pack(side="right", padx=(8, 0))
+        botao(acoes, rotulo_botao, confirmar, estilo="perigo", width=150).pack(side="right")
+
+    def _pedir_nome_perfil(self) -> str | None:
+        janela, caixa = self._dialogo("Novo perfil", 400, 190)
+        resultado: dict[str, str | None] = {"nome": None}
+        rotulo(caixa, "Nome do perfil", tamanho=18, peso="bold", titulo=True).pack(anchor="w", padx=18, pady=(16, 6))
+        campo = entrada(caixa, largura=340, height=40)
+        campo.pack(fill="x", padx=18, pady=4)
+
+        def confirmar(_evento=None):
+            resultado["nome"] = campo.get().strip() or None
+            janela.destroy()
+
+        acoes = ctk.CTkFrame(caixa, fg_color="transparent")
+        acoes.pack(fill="x", padx=18, pady=(8, 14))
+        botao(acoes, "Cancelar", janela.destroy, width=110).pack(side="right", padx=(8, 0))
+        botao(acoes, "Criar", confirmar, estilo="primario", width=110).pack(side="right")
+        janela.bind("<Return>", confirmar)
+        janela.bind("<Escape>", lambda _e: janela.destroy())
+        campo.focus_set()
+        self.wait_window(janela)
+        return resultado["nome"]
+
+    def _aviso(self, titulo: str, mensagem: str, erro: bool = False) -> None:
+        janela, caixa = self._dialogo(titulo, 440, 210)
+        rotulo(caixa, titulo, cor=T.TERRACOTA if erro else T.CARAMELO, tamanho=18, peso="bold", titulo=True).pack(
+            anchor="w", padx=18, pady=(16, 8))
+        rotulo(caixa, mensagem, cor=T.TEXTO, tamanho=13, wraplength=int(390 * self.esc), justify="left").pack(
+            fill="x", padx=18, pady=(0, 8))
+        botao(caixa, "Fechar", janela.destroy, width=110).pack(side="bottom", anchor="e", padx=18, pady=14)
+        janela.bind("<Escape>", lambda _e: janela.destroy())
+
+    # ------------------------------------------------------------ eventos e status
+    def _consumir_eventos(self):
+        try:
+            while True:
+                evento = self.eventos.get_nowait()
+                if evento[0] == "log":
+                    _, nivel, msg = evento
+                    self._log_local(nivel, msg)
+                elif evento[0] == "status":
+                    _, estado, ciclo, inicio = evento
+                    self.status_atual = estado
+                    self.ciclo_atual = ciclo
+                    self.inicio_ativo = inicio if estado not in {"ocioso", "parado"} else None
+                    if estado in {"ocioso", "parado"} and self.minimizado_por_execucao:
+                        self.minimizado_por_execucao = False
+                        self.deiconify()
+                        self.lift()
+                    self._atualizar_status()
+                elif evento[0] == "teste":
+                    _, resultado, nome = evento
+                    if self.minimizado_por_teste:
+                        self.minimizado_por_teste = False
+                        self.deiconify()
+                        self.lift()
+                    if resultado:
+                        self._log_local("ok", f"alvo {nome} localizado em {resultado.centro} · precisão {resultado.confianca:.2f}")
+                    else:
+                        self._log_local("erro", f"alvo {nome} não encontrado")
+                elif evento[0] == "teste_erro":
+                    _, erro, nome = evento
+                    self._log_local("erro", f"teste de {nome} falhou: {erro}")
+        except queue.Empty:
+            pass
+        try:
+            if self.winfo_exists():
+                self.after(80, self._consumir_eventos)
+        except tk.TclError:
+            pass
+
+    def _log_local(self, nivel, mensagem):
+        self.log.configure(state="normal")
+        self.log.insert("end", f"{time.strftime('%H:%M:%S')}  ", "tempo")
+        self.log.insert("end", mensagem + "\n", nivel if nivel in {"ok", "erro", "info"} else "info")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _atualizar_status(self):
+        if self.status_atual in {"vendo", "agindo", "aguardando"}:
+            texto, cor_texto = f"Caçando, ciclo {self.ciclo_atual}", T.SALVIA
+        elif self.status_atual == "parado":
+            texto, cor_texto = "Parado", T.TERRACOTA
+        else:
+            texto, cor_texto = "Pronto", T.SUAVE
+        self.status_label.configure(text=f"●  {texto}", text_color=cor_texto)
+
+    def _emitir_avisos_perfis(self) -> None:
+        while self.repositorio.avisos:
+            self._log_local("erro", self.repositorio.avisos.pop(0))
+
+    # ------------------------------------------------------------ perfis
+    def _trocar_perfil(self, nome: str) -> None:
+        self._salvar_edicao()
+        self._salvar_perfil()
+        self.perfil_atual = self.repositorio.carregar(nome)
+        self._emitir_avisos_perfis()
+        self.modo = self.perfil_atual.modo
+        self.ciclos = self.perfil_atual.ciclos
+        self.modo_var.set(self._rotulo_modo(self.modo))
+        self.ciclos_var.set(str(self.ciclos))
+        self.indice_selecionado = None
+        self._atualizar_perfis()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+        self._log_local("info", f"perfil carregado: {nome}")
+
+    def _novo_perfil(self) -> None:
+        self._salvar_edicao()
+        self._salvar_perfil()
+        nome = self._pedir_nome_perfil()
+        if not nome:
+            return
+        try:
+            seguro = nome_seguro(nome)
+        except ValueError as erro:
+            self._aviso("Nome inválido", str(erro), erro=True)
+            return
+        if seguro in self.perfis:
+            self._aviso("Perfil existente", "Esse perfil já está na lista.")
+            return
+        self.perfil_atual = Perfil(seguro)
+        self.repositorio.salvar(self.perfil_atual)
+        self.perfis = self.repositorio.listar()
+        self.modo = "simples"
+        self.modo_var.set("Simples")
+        self.ciclos = 1
+        self.ciclos_var.set("1")
+        self.indice_selecionado = None
+        self._atualizar_perfis()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    def _salvar_perfil(self) -> None:
+        try:
+            self.perfil_atual.modo = self.modo
+            self.perfil_atual.ciclos = max(1, self.ciclos)
+            self.repositorio.salvar(self.perfil_atual)
+        except (OSError, ValueError) as erro:
+            self._log_local("erro", f"erro salvando perfil: {erro}")
+
+    def _salvar_modo(self) -> None:
+        try:
+            self.ciclos = max(1, int(self.ciclos_var.get()))
+        except ValueError:
+            self.ciclos = 1
+            self.ciclos_var.set("1")
+        self._salvar_perfil()
+
+    # ------------------------------------------------------------ alvos
+    def _selecionar_alvo(self, indice: int) -> None:
+        if self.indice_selecionado == indice:
+            return
+        self._salvar_edicao()
+        self.indice_selecionado = indice
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    def _alvo_selecionado(self) -> Alvo | None:
+        if self.indice_selecionado is None or not (0 <= self.indice_selecionado < len(self.perfil_atual.alvos)):
+            return None
+        return self.perfil_atual.alvos[self.indice_selecionado]
+
+    def _capturar(self) -> None:
+        if self.executor.ativo:
+            self._log_local("erro", "pare a execução antes de capturar uma tela")
+            return
+        self._salvar_edicao()
+        self.iconify()
+        self.after(500, self._abrir_overlay)
+
+    def _abrir_overlay(self) -> None:
+        try:
+            self.overlay = OverlayCaptura(self, self._captura_concluida, self._captura_cancelada)
+        except Exception as erro:
+            self.deiconify()
+            self._aviso("Captura indisponível", str(erro), erro=True)
+
+    def _captura_concluida(self, imagem: Image.Image, monitor: int) -> None:
+        self.overlay = None
+        self.deiconify()
+        self.lift()
+        try:
+            novo = salvar_alvo(
+                imagem, self.raiz_dados, self.perfil_atual.nome, monitor,
+                len(self.perfil_atual.alvos) + 1,
+            )
+            self.perfil_atual.alvos.append(novo)
+            self.indice_selecionado = len(self.perfil_atual.alvos) - 1
+            self._salvar_perfil()
+            self._renderizar_fila()
+            self._atualizar_inspecao()
+            self._log_local("ok", f"alvo capturado: {novo.nome} (monitor {monitor})")
+        except Exception as erro:
+            self._aviso("Erro de captura", str(erro), erro=True)
+
+    def _captura_cancelada(self) -> None:
+        self.overlay = None
+        self.deiconify()
+        self.lift()
+
+    def _mover_alvo(self, direcao: int) -> None:
+        self._salvar_edicao()
+        indice = self.indice_selecionado
+        destino = None if indice is None else indice + direcao
+        if destino is None or not 0 <= destino < len(self.perfil_atual.alvos):
+            return
+        alvos = self.perfil_atual.alvos
+        alvos[indice], alvos[destino] = alvos[destino], alvos[indice]
+        self.indice_selecionado = destino
+        self._salvar_perfil()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    def _testar_alvo(self) -> None:
+        if self.executor.ativo:
+            self._log_local("erro", "pare a execução antes de testar um alvo")
+            return
+        alvo = self._alvo_selecionado()
+        if not alvo:
+            self._log_local("erro", "selecione um alvo para testar")
+            return
+        self._salvar_edicao()
+        alvo_copia = deepcopy(alvo)
+        restringir = self.cfg["restringir_monitor"]
+        self._log_local("info", f"testando alvo: {alvo.nome}")
+
+        def worker():
+            try:
+                resultado = localizar(
+                    self.raiz_dados / alvo_copia.arquivo,
+                    alvo_copia.confianca,
+                    alvo_copia.tentativas,
+                    alvo_copia.intervalo_tentativa_ms,
+                    alvo_copia.monitor_origem,
+                    restringir,
+                )
+                self.eventos.put(("teste", resultado, alvo_copia.nome))
+            except Exception as erro:
+                self.eventos.put(("teste_erro", str(erro), alvo_copia.nome))
+
+        def iniciar_teste():
+            threading.Thread(target=worker, name="hunter-cat-teste-alvo", daemon=True).start()
+
+        if self.cfg["minimizar_ao_executar"]:
+            self.minimizado_por_teste = True
+            self.iconify()
+            self.after(400, iniciar_teste)
+        else:
+            iniciar_teste()
+
+    def _duplicar_alvo(self) -> None:
+        self._salvar_edicao()
+        atual = self._alvo_selecionado()
+        if not atual:
+            return
+        caminho = self.raiz_dados / atual.arquivo
+        try:
+            with Image.open(caminho) as img:
+                copia = salvar_alvo(
+                    img.copy(), self.raiz_dados, self.perfil_atual.nome,
+                    atual.monitor_origem, len(self.perfil_atual.alvos) + 1,
+                    nome=f"{atual.nome}_copia",
+                )
+            for campo in ("acao", "texto", "delay_ms", "confianca", "tentativas", "intervalo_tentativa_ms",
+                          "digitar_humano", "scroll_pixels", "tecla", "sensivel", "destinos_permitidos"):
+                setattr(copia, campo, deepcopy(getattr(atual, campo)))
+            salvar_metadados(copia, (self.raiz_dados / copia.arquivo).with_suffix(".json"))
+            self.perfil_atual.alvos.append(copia)
+            self.indice_selecionado = len(self.perfil_atual.alvos) - 1
+            self._salvar_perfil()
+            self._renderizar_fila()
+            self._atualizar_inspecao()
+        except OSError as erro:
+            self._aviso("Erro ao duplicar", str(erro), erro=True)
+
+    def _remover_alvo(self):
+        alvo = self._alvo_selecionado()
+        if alvo:
+            self._confirmar_acao("Remover alvo", f"Remover {alvo.nome} da fila? A imagem fica guardada na pasta.",
+                                 self._remover_alvo_confirmado, "Remover")
+
+    def _remover_alvo_confirmado(self) -> None:
+        self._salvar_edicao()
+        alvo = self._alvo_selecionado()
+        if not alvo:
+            return
+        alvo.in_queue = False
+        try:
+            salvar_metadados(alvo, (self.raiz_dados / alvo.arquivo).with_suffix(".json"))
+        except OSError as erro:
+            alvo.in_queue = True
+            self._log_local("erro", f"não foi possível salvar a remoção: {erro}")
+            return
+        del self.perfil_atual.alvos[self.indice_selecionado]
+        if self.perfil_atual.alvos:
+            self.indice_selecionado = min(self.indice_selecionado, len(self.perfil_atual.alvos) - 1)
+        else:
+            self.indice_selecionado = None
+        self._salvar_perfil()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    # ------------------------------------------------------------ execução
+    def _executar(self) -> None:
+        self._salvar_edicao()
+        self._salvar_modo()
+        if self.cfg["bip"]:
+            threading.Thread(target=self._bip, daemon=True).start()
+
+        def iniciar_motor():
+            iniciado = self.executor.iniciar(self.perfil_atual, self.modo, self.ciclos)
+            if not iniciado and self.minimizado_por_execucao:
+                self.minimizado_por_execucao = False
+                self.deiconify()
+                self.lift()
+
+        if self.cfg["minimizar_ao_executar"]:
+            self.minimizado_por_execucao = True
+            self.iconify()
+            self.after(500, iniciar_motor)
+        else:
+            iniciar_motor()
+
+    @staticmethod
+    def _bip() -> None:
+        try:
+            import winsound
+            winsound.Beep(440, 150)
+        except (ImportError, RuntimeError):
+            pass
+
+    def _parar(self) -> None:
+        self.executor.parar()
+
+    def _resetar(self) -> None:
+        if self.executor.ativo:
+            self.executor.parar("execução parada para reiniciar")
+        self.ciclo_atual = 0
+        self.inicio_ativo = None
+        self.status_atual = "ocioso"
+        self._atualizar_status()
+
+    # ------------------------------------------------------------ encerramento
+    def _fechar(self):
+        if self.executor.ativo:
+            self._confirmar_acao("Fechar o Hunter Cat", "Há uma execução em andamento. Parar e fechar?",
+                                 self._fechar_confirmado, "Parar e fechar")
+        else:
+            self._fechar_confirmado()
+
+    def _fechar_confirmado(self):
+        self._salvar_edicao()
+        self._salvar_perfil()
+        self.executor.parar("aplicativo fechado")
+        if self.overlay is not None:
+            try:
+                self.overlay.janela.destroy()
+            except Exception:
+                pass
+        try:
+            self.cena.parar()
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ==================== main.py ====================
+
+def executar_selftest() -> int:
+    resultados = []
+    try:
+        cor_alvo = (30, 145, 235)
+        template = np.full((12, 12, 3), cor_alvo, dtype=np.uint8)
+        quadro = np.full((180, 260, 3), (32, 32, 32), dtype=np.uint8)
+        for x, y in ((20, 25), (110, 55), (205, 120), (60, 135)):
+            quadro[y:y + 12, x:x + 12] = cor_alvo
+        monitor = {"left": 0, "top": 0, "width": 260, "height": 180}
+        plano = _score_cor_dominante(template, quadro, 1, monitor)
+        resultados.append(("quadrado liso", bool(plano and plano.confianca >= .55)))
+        ruido = quadro.copy()
+        rng = np.random.default_rng(7)
+        ruido[:] = np.clip(ruido.astype(np.int16) + rng.integers(-5, 6, ruido.shape), 0, 255).astype(np.uint8)
+        plano = _score_cor_dominante(template, ruido, 1, monitor)
+        resultados.append(("variação de cor", bool(plano and plano.confianca >= .55)))
+        ok, jpg = cv2.imencode(".jpg", quadro, [cv2.IMWRITE_JPEG_QUALITY, 40])
+        img = cv2.imdecode(jpg, cv2.IMREAD_COLOR) if ok else None
+        plano = _score_cor_dominante(template, img, 1, monitor) if img is not None else None
+        resultados.append(("JPEG", bool(plano and plano.confianca >= .55)))
+        scaled = cv2.resize(template, (18, 18), interpolation=cv2.INTER_NEAREST)
+        frame = np.full((120, 160, 3), (25, 25, 25), dtype=np.uint8)
+        frame[43:61, 71:89] = scaled
+        plano = _candidatos_template(template, frame, 1, {"left": 0, "top": 0, "width": 160, "height": 120})
+        resultados.append(("multiescala", bool(plano and plano.confianca >= .55)))
+    except Exception as erro:
+        print(f"FALHOU · selftest interno · {erro}")
+        return 1
+    for nome, ok in resultados:
+        print(f"{'PASSOU' if ok else 'FALHOU'} · {nome}")
+    return 0 if all(ok for _, ok in resultados) else 1
+
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Hunter Cat · automatizador visual")
+    parser.add_argument("--selftest", action="store_true")
+    args = parser.parse_args()
+    if args.selftest:
+        raise SystemExit(executar_selftest())
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = .05
+    app = JanelaHunterCat()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
