@@ -1,0 +1,1852 @@
+# -*- coding: utf-8 -*-
+"""Cérbero — aplicativo completo em um único arquivo para Windows.
+
+Dependências: instale as bibliotecas listadas em requirements.txt.
+Compatibilidade: Python 3.11 ou mais recente; PyCharm recente com CPython Windows 64-bit.
+"""
+
+
+# ==================== motor/modelos.py ====================
+
+
+from __future__ import annotations
+
+# DPI awareness must be set before MSS, Tk, or PyAutoGUI read screen metrics.
+import sys as _dpi_sys
+if _dpi_sys.platform == "win32":
+    import ctypes as _dpi_ctypes
+    try:
+        _dpi_ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            _dpi_ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+from dataclasses import asdict, dataclass, field
+from typing import Any
+
+
+@dataclass
+class Alvo:
+    id: str
+    nome: str
+    arquivo: str
+    ordem: int = 0
+    in_queue: bool = True
+    acao: str = "clique"
+    texto: str = ""
+    delay_ms: int = 450
+    confianca: float = 0.85
+    tentativas: int = 5
+    intervalo_tentativa_ms: int = 400
+    monitor_origem: int = 0
+    digitar_humano: bool = False
+    scroll_pixels: int = 500
+    tecla: str = "enter"
+
+    @classmethod
+    def de_dict(cls, dados: dict[str, Any]) -> "Alvo":
+        campos = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in dados.items() if k in campos})
+
+    def para_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Perfil:
+    nome: str
+    alvos: list[Alvo] = field(default_factory=list)
+    modo: str = "simples"
+    ciclos: int = 1
+
+    @classmethod
+    def de_dict(cls, dados: dict[str, Any]) -> "Perfil":
+        return cls(
+            nome=str(dados.get("nome", "perfil")),
+            alvos=[Alvo.de_dict(a) for a in dados.get("alvos", [])],
+            modo=str(dados.get("modo", "simples")),
+            ciclos=max(1, int(dados.get("ciclos", 1))),
+        )
+
+    def para_dict(self) -> dict[str, Any]:
+        return {
+            "nome": self.nome,
+            "alvos": [a.para_dict() for a in self.alvos],
+            "modo": self.modo,
+            "ciclos": self.ciclos,
+        }
+
+
+# ==================== motor/captura.py ====================
+
+
+
+import json
+import uuid
+from pathlib import Path
+
+from PIL import Image
+
+_PIL_RESAMPLING = getattr(Image, "Resampling", Image)
+_PIL_LANCZOS = getattr(_PIL_RESAMPLING, "LANCZOS", getattr(Image, "ANTIALIAS", 1))
+
+
+
+def diretorio_alvos(raiz: Path, perfil: str) -> Path:
+    pasta = raiz / "alvos" / perfil
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def salvar_alvo(
+    imagem: Image.Image,
+    raiz: Path,
+    perfil: str,
+    monitor_origem: int,
+    ordem: int,
+    nome: str | None = None,
+) -> Alvo:
+    """Salva cada recorte como PNG e mantém sua configuração num JSON irmão."""
+    alvo_id = uuid.uuid4().hex
+    pasta = diretorio_alvos(raiz, perfil)
+    caminho_png = pasta / f"{alvo_id}.png"
+    caminho_json = pasta / f"{alvo_id}.json"
+    imagem.convert("RGB").save(caminho_png, format="PNG", optimize=True)
+    alvo = Alvo(
+        id=alvo_id,
+        nome=nome or f"alvo_{ordem:02d}",
+        arquivo=str(caminho_png.relative_to(raiz)),
+        ordem=ordem,
+        monitor_origem=monitor_origem,
+    )
+    salvar_metadados(alvo, caminho_json)
+    return alvo
+
+
+def salvar_metadados(alvo: Alvo, caminho: Path) -> None:
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    temporario = caminho.with_suffix(".json.tmp")
+    temporario.write_text(
+        json.dumps(alvo.para_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporario.replace(caminho)
+
+
+def caminho_metadados(raiz: Path, alvo: Alvo) -> Path:
+    return (raiz / alvo.arquivo).with_suffix(".json")
+
+
+def carregar_metadados(raiz: Path, arquivo_png: str) -> Alvo | None:
+    caminho_png = raiz / arquivo_png
+    caminho_json = caminho_png.with_suffix(".json")
+    if not caminho_json.exists():
+        return None
+    try:
+        return Alvo.de_dict(json.loads(caminho_json.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def carregar_preview(raiz: Path, alvo: Alvo, limite: tuple[int, int] = (260, 185)) -> Image.Image | None:
+    caminho = raiz / alvo.arquivo
+    if not caminho.is_file():
+        return None
+    try:
+        imagem = Image.open(caminho).convert("RGB")
+        imagem.thumbnail(limite, _PIL_LANCZOS)
+        return imagem.copy()
+    except OSError:
+        return None
+
+
+# ==================== motor/perfis.py ====================
+
+
+
+import json
+import re
+from pathlib import Path
+
+
+
+def nome_seguro(nome: str) -> str:
+    limpo = re.sub(r"[^\w.-]+", "_", nome.strip(), flags=re.UNICODE).strip("._")
+    if not limpo or limpo in {".", ".."}:
+        raise ValueError("Dê ao perfil um nome com letras ou números.")
+    return limpo[:64]
+
+
+class RepositorioPerfis:
+    def __init__(self, raiz: Path):
+        self.raiz = raiz
+        self.pasta = raiz / "perfis"
+        self.avisos: list[str] = []
+        self.pasta.mkdir(parents=True, exist_ok=True)
+        (raiz / "alvos").mkdir(parents=True, exist_ok=True)
+
+    def listar(self) -> list[str]:
+        return sorted(p.stem for p in self.pasta.glob("*.json") if p.is_file())
+
+    def _validar_caminho_alvo(self, perfil: str, arquivo: str) -> Path:
+        if not isinstance(arquivo, str):
+            raise ValueError("O caminho do alvo precisa ser texto.")
+        raiz = self.raiz.resolve()
+        pasta_perfil = (raiz / "alvos" / perfil).resolve()
+        caminho = (raiz / arquivo).resolve()
+        caminho.relative_to(raiz)
+        if caminho.parent != pasta_perfil or caminho.suffix.lower() != ".png":
+            raise ValueError(f"Arquivo de alvo fora da pasta do perfil: {arquivo}")
+        return caminho
+
+    def carregar(self, nome: str) -> Perfil:
+        seguro = nome_seguro(nome)
+        caminho = self.pasta / f"{seguro}.json"
+        if not caminho.exists():
+            return Perfil(nome=seguro)
+        try:
+            dados = json.loads(caminho.read_text(encoding="utf-8"))
+            perfil = Perfil.de_dict(dados)
+            perfil.nome = seguro
+            alvos_validos: list[Alvo] = []
+            for alvo in perfil.alvos:
+                try:
+                    self._validar_caminho_alvo(seguro, alvo.arquivo)
+                    alvos_validos.append(alvo)
+                except (OSError, TypeError, ValueError):
+                    self.avisos.append(f"caminho inválido ignorado no perfil {seguro}: {alvo.arquivo}")
+            perfil.alvos = alvos_validos
+            return perfil
+        except (OSError, ValueError, TypeError) as erro:
+            recuperados: list[Alvo] = []
+            pasta_alvos = (self.raiz / "alvos" / seguro).resolve()
+            for arquivo_json in sorted(pasta_alvos.glob("*.json")):
+                try:
+                    alvo = Alvo.de_dict(json.loads(arquivo_json.read_text(encoding="utf-8")))
+                    caminho_png = (self.raiz / alvo.arquivo).resolve()
+                    caminho_png.relative_to(self.raiz.resolve())
+                    if (alvo.in_queue and caminho_png.parent == pasta_alvos and caminho_png.suffix.lower() == ".png"
+                            and caminho_png.is_file() and alvo.id == arquivo_json.stem):
+                        recuperados.append(alvo)
+                except (OSError, ValueError, TypeError):
+                    continue
+            recuperados.sort(key=lambda alvo: (alvo.ordem, alvo.id))
+            if recuperados:
+                perfil = Perfil(nome=seguro, alvos=recuperados)
+                self.salvar(perfil)
+                self.avisos.append(
+                    f"perfil {seguro} estava corrompido; fila recuperada de {len(recuperados)} JSON(s) de alvo"
+                )
+                return perfil
+            self.avisos.append(
+                f"perfil {seguro} não pôde ser lido ({erro}); nenhum alvo foi recuperado"
+            )
+            return Perfil(nome=seguro)
+
+    def salvar(self, perfil: Perfil) -> None:
+        seguro = nome_seguro(perfil.nome)
+        perfil.nome = seguro
+        for ordem, alvo in enumerate(perfil.alvos, start=1):
+            self._validar_caminho_alvo(seguro, alvo.arquivo)
+            alvo.ordem = ordem
+            alvo.in_queue = True
+            salvar_metadados(alvo, caminho_metadados(self.raiz, alvo))
+        caminho = self.pasta / f"{seguro}.json"
+        temporario = caminho.with_suffix(".json.tmp")
+        temporario.write_text(
+            json.dumps(perfil.para_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporario.replace(caminho)
+
+
+# ==================== motor/visao.py ====================
+
+
+
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+import cv2
+import mss
+import numpy as np
+
+
+# Include the captured size plus nearby scales so resizing a browser or game
+# window does not make an otherwise identical target impossible to find.
+_ESCALAS_TEMPLATE = (0.65, 0.75, 0.85, 0.95, 1.0, 1.10, 1.20, 1.30, 1.40, 1.50)
+
+
+@dataclass
+class Correspondencia:
+    x: int
+    y: int
+    largura: int
+    altura: int
+    confianca: float
+    monitor: int
+
+    @property
+    def centro(self) -> tuple[int, int]:
+        return self.x + self.largura // 2, self.y + self.altura // 2
+
+
+def _normalizar(cinza: np.ndarray) -> np.ndarray:
+    # Equalização local reduz variações de brilho; normalização mantém os dois
+    # lados do casamento na mesma escala antes do TM_CCOEFF_NORMED.
+    equalizada = cv2.equalizeHist(cinza)
+    return cv2.normalize(equalizada, None, 0, 255, cv2.NORM_MINMAX)
+
+
+def carregar_template(caminho: Path) -> np.ndarray:
+    imagem = cv2.imread(str(caminho), cv2.IMREAD_GRAYSCALE)
+    if imagem is None or imagem.size == 0:
+        raise ValueError(f"Não foi possível abrir o alvo: {caminho}")
+    return _normalizar(imagem)
+
+
+def buscar_uma_vez(
+    template: np.ndarray,
+    confianca_minima: float,
+    monitor_origem: int = 0,
+    restringir_monitor: bool = False,
+) -> Correspondencia | None:
+    """Examina o monitor virtual ou todos os monitores físicos configurados."""
+    with mss.MSS() as capturador:
+        monitores = capturador.monitors[1:]
+        if not monitores:
+            return None
+        if restringir_monitor and 1 <= monitor_origem <= len(monitores):
+            candidatos = [(monitor_origem, monitores[monitor_origem - 1])]
+        else:
+            candidatos = list(enumerate(monitores, start=1))
+
+        melhor: Correspondencia | None = None
+        for indice, monitor in candidatos:
+            frame = np.asarray(capturador.grab(monitor))
+            # MSS fornece BGRA; o conversor correto preserva a luminância capturada.
+            cinza = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+            cinza = _normalizar(cinza)
+            altura, largura = cinza.shape[:2]
+            altura_original, largura_original = template.shape[:2]
+            for escala in _ESCALAS_TEMPLATE:
+                largura_template = max(1, round(largura_original * escala))
+                altura_template = max(1, round(altura_original * escala))
+                if altura_template > altura or largura_template > largura:
+                    continue
+                if escala == 1.0:
+                    template_escala = template
+                else:
+                    interpolacao = cv2.INTER_AREA if escala < 1.0 else cv2.INTER_CUBIC
+                    template_escala = cv2.resize(
+                        template, (largura_template, altura_template), interpolation=interpolacao
+                    )
+                    template_escala = _normalizar(template_escala)
+                resultado = cv2.matchTemplate(cinza, template_escala, cv2.TM_CCOEFF_NORMED)
+                _, valor, _, local = cv2.minMaxLoc(resultado)
+                if melhor is None or valor > melhor.confianca:
+                    melhor = Correspondencia(
+                        x=int(monitor["left"] + local[0]),
+                        y=int(monitor["top"] + local[1]),
+                        largura=largura_template,
+                        altura=altura_template,
+                        confianca=float(valor),
+                        monitor=indice,
+                    )
+        if melhor and melhor.confianca >= confianca_minima:
+            return melhor
+        return None
+
+
+def localizar(
+    caminho: Path,
+    confianca_minima: float = 0.85,
+    tentativas: int = 5,
+    intervalo_ms: int = 400,
+    monitor_origem: int = 0,
+    restringir_monitor: bool = False,
+    cancelado: Callable[[], bool] | None = None,
+    ao_tentar: Callable[[int, float | None], None] | None = None,
+) -> Correspondencia | None:
+    """Repete a busca sem bloquear a UI; cada tentativa pode ser cancelada."""
+    template = carregar_template(caminho)
+    total = max(1, tentativas)
+    for tentativa in range(1, total + 1):
+        if cancelado and cancelado():
+            return None
+        achado = buscar_uma_vez(
+            template, confianca_minima, monitor_origem, restringir_monitor
+        )
+        if ao_tentar:
+            ao_tentar(tentativa, achado.confianca if achado else None)
+        if achado:
+            return achado
+        if tentativa < total:
+            fim = time.monotonic() + max(0, intervalo_ms) / 1000
+            while time.monotonic() < fim:
+                if cancelado and cancelado():
+                    return None
+                time.sleep(min(0.05, max(0, fim - time.monotonic())))
+    return None
+
+
+# ==================== motor/acoes.py ====================
+
+
+
+import random
+import time
+from typing import Any
+
+
+ACOES = (
+    "clique",
+    "clique_duplo",
+    "clique_direito",
+    "digitar",
+    "tecla",
+    "scroll",
+    "esperar",
+    "pausar_ate_encontrar",
+)
+
+
+def _controlador(direct_input: bool) -> tuple[Any, bool]:
+    if direct_input:
+        try:
+            import pydirectinput
+
+            pydirectinput.FAILSAFE = True
+            pydirectinput.PAUSE = 0
+            return pydirectinput, False
+        except ImportError:
+            # Keep web/UI actions working if the optional game backend is absent.
+            # The executor reports that this fallback may not work in games.
+            pass
+    import pyautogui
+
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0
+    return pyautogui, bool(direct_input)
+
+
+def executar_acao(
+    acao: str,
+    posicao: tuple[int, int] | None,
+    texto: str,
+    tecla: str,
+    scroll_pixels: int,
+    digitar_humano: bool,
+    direct_input: bool,
+) -> bool:
+    controle, usou_reserva = _controlador(direct_input)
+    if acao in {"clique", "clique_duplo", "clique_direito"}:
+        if posicao is None:
+            raise ValueError("A ação de mouse precisa de um alvo localizado.")
+        controle.moveTo(*posicao, duration=0)
+        if acao == "clique":
+            controle.click()
+        elif acao == "clique_duplo":
+            controle.doubleClick()
+        else:
+            controle.rightClick()
+    elif acao == "digitar":
+        if posicao is None:
+            raise ValueError("A ação de digitar precisa de um campo localizado.")
+        controle.click(*posicao)
+        time.sleep(0.08)
+        if digitar_humano:
+            for indice, caractere in enumerate(texto):
+                controle.write(caractere)
+                if indice < len(texto) - 1:
+                    time.sleep(random.uniform(0.04, 0.12))
+        else:
+            controle.write(texto)
+    elif acao == "tecla":
+        teclas = [parte.strip() for parte in tecla.lower().replace("+", " ").split() if parte.strip()]
+        if not teclas:
+            raise ValueError("Informe uma tecla ou combinação, como ctrl+s.")
+        if len(teclas) == 1:
+            controle.press(teclas[0])
+        else:
+            controle.hotkey(*teclas)
+    elif acao == "scroll":
+        if posicao is None:
+            raise ValueError("A ação de scroll precisa de um alvo localizado.")
+        controle.moveTo(*posicao, duration=0)
+        # APIs de mouse recebem passos da roda; 40 px é a aproximação por passo.
+        controle.scroll(round(int(scroll_pixels) / 40))
+    elif acao in {"esperar", "pausar_ate_encontrar"}:
+        return False
+    else:
+        raise ValueError(f"Ação desconhecida: {acao}")
+    return usou_reserva
+
+
+# ==================== motor/executor.py ====================
+
+
+
+import queue
+import threading
+import time
+from pathlib import Path
+from typing import Callable
+
+
+
+class Executor:
+    def __init__(
+        self,
+        raiz: Path,
+        eventos: queue.Queue,
+        restringir_monitor: bool = False,
+        direct_input: bool = False,
+    ):
+        self.raiz = raiz
+        self.eventos = eventos
+        self.restringir_monitor = restringir_monitor
+        self.direct_input = direct_input
+        self.parar_evento = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.inicio: float | None = None
+        self.ciclo = 0
+        self._listener = None
+
+    @property
+    def ativo(self) -> bool:
+        return bool(self.thread and self.thread.is_alive())
+
+    def iniciar(self, perfil: Perfil, modo: str, ciclos: int) -> bool:
+        if self.ativo:
+            return False
+        if not perfil.alvos:
+            self.eventos.put(("log", "erro", "fila vazia; adicione um alvo antes de executar"))
+            return False
+        self.parar_evento.clear()
+        self.ciclo = 0
+        self.thread = threading.Thread(
+            target=self._rodar, args=(perfil, modo, max(1, ciclos)),
+            name="cerbero-executor", daemon=True,
+        )
+        self.thread.start()
+        return True
+
+    def parar(self, motivo: str = "parada solicitada") -> None:
+        if self.ativo:
+            self.eventos.put(("log", "info", motivo))
+            self.parar_evento.set()
+
+    def _registrar_hotkey(self) -> None:
+        # pynput escuta em nível global, inclusive se o painel estiver minimizado.
+        try:
+            from pynput import keyboard
+
+            def ao_pressionar(tecla):
+                if tecla in (keyboard.Key.esc, keyboard.Key.f12):
+                    self.parar("botão de pânico acionado")
+
+            self._listener = keyboard.Listener(on_press=ao_pressionar)
+            self._listener.daemon = True
+            self._listener.start()
+            return
+        except Exception:
+            self._listener = None
+        try:
+            import keyboard
+
+            keyboard.add_hotkey("esc", lambda: self.parar("botão de pânico acionado"))
+            keyboard.add_hotkey("f12", lambda: self.parar("botão de pânico acionado"))
+            self._listener = "keyboard"
+        except Exception as erro:
+            self.eventos.put(("log", "erro", f"hotkey global indisponível: {erro}"))
+
+    def _remover_hotkey(self) -> None:
+        if self._listener == "keyboard":
+            try:
+                import keyboard
+
+                keyboard.unhook_all_hotkeys()
+            except Exception:
+                pass
+        elif self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+        self._listener = None
+
+    def _log(self, nivel: str, mensagem: str) -> None:
+        self.eventos.put(("log", nivel, mensagem))
+
+    def _localizar(self, alvo, infinito: bool = False) -> Correspondencia | None:
+        caminho = self.raiz / alvo.arquivo
+        if not caminho.is_file():
+            self._log("erro", f"alvo ausente: {alvo.nome}")
+            return None
+        while not self.parar_evento.is_set():
+            def registrar_tentativa(numero: int, confianca: float | None) -> None:
+                total = max(1, int(alvo.tentativas))
+                if not infinito and confianca is None and numero < total:
+                    self._log("info", f"alvo {alvo.nome} abaixo da confiança; retentando ({numero}/{total})")
+
+            resultado = localizar(
+                caminho,
+                confianca_minima=float(alvo.confianca),
+                tentativas=1 if infinito else int(alvo.tentativas),
+                intervalo_ms=int(alvo.intervalo_tentativa_ms),
+                monitor_origem=int(alvo.monitor_origem),
+                restringir_monitor=self.restringir_monitor,
+                cancelado=self.parar_evento.is_set,
+                ao_tentar=registrar_tentativa,
+            )
+            if resultado:
+                return resultado
+            if not infinito or self.parar_evento.is_set():
+                return None
+            self.eventos.put(("status", "aguardando", self.ciclo, self.inicio))
+            self.parar_evento.wait(max(0, int(alvo.intervalo_tentativa_ms)) / 1000)
+        return None
+
+    def _esperar_cooperativo(self, milissegundos: int) -> None:
+        self.parar_evento.wait(max(0, milissegundos) / 1000)
+
+    def _executar_alvo(self, alvo, indice: int) -> None:
+        if self.parar_evento.is_set():
+            return
+        self.eventos.put(("status", "executando", self.ciclo, self.inicio))
+        posicao: tuple[int, int] | None = None
+        correspondencia = None
+        if alvo.acao == "pausar_ate_encontrar":
+            self._log("info", f"aguardando alvo {indice:02d}: {alvo.nome}")
+            correspondencia = self._localizar(alvo, infinito=True)
+        elif alvo.acao not in {"esperar"}:
+            self._log("info", f"buscando alvo {indice:02d}: {alvo.nome}")
+            correspondencia = self._localizar(alvo)
+            if correspondencia is None:
+                if not self.parar_evento.is_set():
+                    self._log("erro", f"alvo {indice:02d} não localizado; seguindo para o próximo")
+                return
+            posicao = correspondencia.centro
+            self._log(
+                "ok",
+                f"alvo {indice:02d} localizado em ({posicao[0]}, {posicao[1]}) · "
+                f"confiança {correspondencia.confianca:.2f}",
+            )
+        if self.parar_evento.is_set():
+            return
+        try:
+            if alvo.acao == "esperar":
+                self._log("info", f"esperando {alvo.delay_ms} ms")
+                self._esperar_cooperativo(alvo.delay_ms)
+            elif alvo.acao == "pausar_ate_encontrar":
+                if correspondencia:
+                    self._log("ok", f"alvo {indice:02d} encontrado; fila liberada")
+                else:
+                    return
+            else:
+                usou_reserva = executar_acao(
+                    alvo.acao, posicao, alvo.texto, alvo.tecla,
+                    alvo.scroll_pixels, alvo.digitar_humano, self.direct_input,
+                )
+                if usou_reserva:
+                    self._log(
+                        "erro",
+                        "pydirectinput não está instalado neste Python; foi usado PyAutoGUI. "
+                        "Em alguns jogos, instale pydirectinput para receber os comandos.",
+                    )
+                self._log("ok", f"ação {alvo.acao} concluída · {alvo.nome}")
+        except Exception as erro:
+            if erro.__class__.__name__ == "FailSafeException":
+                self.parar_evento.set()
+                self._log("erro", "fail-safe do mouse acionado; execução interrompida")
+            else:
+                self._log("erro", f"falha em {alvo.nome}: {erro}")
+        if alvo.acao != "esperar":
+            self._esperar_cooperativo(alvo.delay_ms)
+
+    def _rodar(self, perfil: Perfil, modo: str, ciclos: int) -> None:
+        self.inicio = time.monotonic()
+        self._registrar_hotkey()
+        self.eventos.put(("status", "executando", self.ciclo, self.inicio))
+        self._log("info", f"varredura iniciada · perfil {perfil.nome} · ESC/F12 para parar")
+        volta = 0
+        try:
+            while not self.parar_evento.is_set():
+                volta += 1
+                self.ciclo = volta
+                self.eventos.put(("status", "executando", self.ciclo, self.inicio))
+                for indice, alvo in enumerate(perfil.alvos, start=1):
+                    if self.parar_evento.is_set():
+                        break
+                    self._executar_alvo(alvo, indice)
+                if modo == "simples" or (modo == "ciclos" and volta >= ciclos):
+                    break
+        except Exception as erro:
+            self._log("erro", f"execução interrompida: {erro}")
+        finally:
+            self._remover_hotkey()
+            self.eventos.put(("status", "ocioso", self.ciclo, self.inicio))
+            self._log("info", "execução encerrada")
+
+
+# ==================== ui/paleta.py ====================
+
+
+FUNDO = "#17130F"
+PAINEL = "#211B15"
+BORDAS = "#3A2A1D"
+AMBAR = "#D9924A"
+PERGAMINHO = "#D8CDB8"
+OLIVA = "#7C7A5E"
+SALVIA = "#6E8A54"
+SANGUE = "#A63A2E"
+AMBAR_QUEIMADO = "#B06E2E"
+
+FONTE = "JetBrains Mono"
+FONTE_FALLBACKS = ("Consolas", "DejaVu Sans Mono")
+
+
+
+
+# Paleta visual, embutida para manter o aplicativo em um único arquivo.
+from types import SimpleNamespace
+cor = SimpleNamespace(
+    FUNDO="#17130F", PAINEL="#211B15", BORDAS="#3A2A1D",
+    AMBAR="#D9924A", PERGAMINHO="#D8CDB8", OLIVA="#7C7A5E",
+    SALVIA="#6E8A54", SANGUE="#A63A2E", AMBAR_QUEIMADO="#B06E2E",
+    FONTE="JetBrains Mono", FONTE_FALLBACKS=("Consolas", "DejaVu Sans Mono"),
+)
+
+# ==================== ui/widgets.py ====================
+
+
+
+import tkinter as tk
+from tkinter import font as tkfont
+
+import customtkinter as ctk
+
+
+
+def fonte(root: tk.Misc, tamanho: int = 12, peso: str = "normal") -> tuple[str, int, str]:
+    familias = set(tkfont.families(root))
+    familia = next((nome for nome in (cor.FONTE, *cor.FONTE_FALLBACKS) if nome in familias), "Consolas")
+    return familia, tamanho, peso
+
+
+def painel(pai, **kwargs):
+    return ctk.CTkFrame(
+        pai, fg_color=cor.PAINEL, border_color=cor.BORDAS, border_width=1,
+        corner_radius=0, **kwargs,
+    )
+
+
+def botao(pai, texto: str, comando=None, *, destaque: bool = False, **kwargs):
+    altura = kwargs.pop("height", 32)
+    return ctk.CTkButton(
+        pai,
+        text=texto,
+        command=comando,
+        fg_color=cor.AMBAR if destaque else cor.PAINEL,
+        hover_color=cor.AMBAR_QUEIMADO,
+        text_color=cor.FUNDO if destaque else cor.PERGAMINHO,
+        border_color=cor.BORDAS,
+        border_width=1,
+        corner_radius=0,
+        font=fonte(pai, 11),
+        height=altura,
+        **kwargs,
+    )
+
+
+def entrada(pai, *, largura: int = 180, **kwargs):
+    # O CTkEntry controla internamente as cores do cursor e da seleção.
+    return ctk.CTkEntry(
+        pai,
+        width=largura,
+        fg_color=cor.FUNDO,
+        text_color=cor.PERGAMINHO,
+        placeholder_text_color=cor.OLIVA,
+        border_color=cor.BORDAS,
+        border_width=1,
+        corner_radius=0,
+        font=fonte(pai, 11),
+        insertwidth=8,
+        insertontime=500,
+        insertofftime=350,
+        **kwargs,
+    )
+
+
+def rotulo(pai, texto: str, *, cor_texto: str = cor.PERGAMINHO, tamanho: int = 11, **kwargs):
+    return ctk.CTkLabel(
+        pai, text=texto, text_color=cor_texto, font=fonte(pai, tamanho),
+        anchor="w", **kwargs,
+    )
+
+
+# ==================== ui/overlay_captura.py ====================
+
+
+
+import ctypes
+import sys
+import tkinter as tk
+from collections.abc import Callable
+
+import mss
+from PIL import Image
+
+
+
+class OverlayCaptura:
+    def __init__(self, root: tk.Misc, ao_capturar: Callable[[Image.Image, int], None], ao_cancelar: Callable[[], None]):
+        self.root = root
+        self.ao_capturar = ao_capturar
+        self.ao_cancelar = ao_cancelar
+        self.monitor_virtual: dict
+        self.monitores: list[dict]
+        with mss.MSS() as sct:
+            self.monitores = list(sct.monitors[1:])
+            if not self.monitores:
+                raise RuntimeError("Nenhum monitor disponível para captura.")
+            self.monitor_virtual = dict(sct.monitors[0])
+            shot = sct.grab(self.monitor_virtual)
+            self.imagem = Image.frombytes("RGB", shot.size, shot.rgb)
+
+        self.inicio: tuple[int, int] | None = None
+        self.retangulo: int | None = None
+        self.mira_h: int | None = None
+        self.mira_v: int | None = None
+        self.janela = tk.Toplevel(root)
+        self.janela.title("CAPTURA DE ALVO")
+        self.janela.configure(bg=cor.FUNDO, cursor="crosshair")
+        self.janela.attributes("-topmost", True)
+        try:
+            self.janela.attributes("-alpha", 0.60)
+        except tk.TclError:
+            pass
+        self.janela.overrideredirect(True)
+        x = self.monitor_virtual["left"]
+        y = self.monitor_virtual["top"]
+        largura = self.monitor_virtual["width"]
+        altura = self.monitor_virtual["height"]
+        if sys.platform == "win32":
+            self.janela.geometry(f"{largura}x{altura}+0+0")
+            self.janela.update_idletasks()
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_bool
+            user32.SetWindowPos(
+                ctypes.c_void_p(self.janela.winfo_id()), ctypes.c_void_p(-1),
+                int(x), int(y), int(largura), int(altura), 0x0040,
+            )
+        else:
+            self.janela.geometry(f"{largura}x{altura}{x:+d}{y:+d}")
+        self.canvas = tk.Canvas(self.janela, bg=cor.FUNDO, highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.create_text(
+            24, 24, anchor="nw", text="ARRASTE PARA MARCAR O ALVO   ·   ESC PARA CANCELAR",
+            fill=cor.AMBAR, font=fonte(root, 13),
+        )
+        self.canvas.bind("<Motion>", self._mover)
+        self.canvas.bind("<ButtonPress-1>", self._iniciar)
+        self.canvas.bind("<B1-Motion>", self._arrastar)
+        self.canvas.bind("<ButtonRelease-1>", self._soltar)
+        self.janela.bind("<Escape>", self.cancelar)
+        self.janela.focus_force()
+
+    def _mover(self, evento) -> None:
+        x, y = evento.x, evento.y
+        largura = self.monitor_virtual["width"]
+        altura = self.monitor_virtual["height"]
+        if self.mira_h is not None:
+            self.canvas.delete(self.mira_h)
+            self.canvas.delete(self.mira_v)
+        self.mira_h = self.canvas.create_line(0, y, largura, y, fill=cor.AMBAR, width=1)
+        self.mira_v = self.canvas.create_line(x, 0, x, altura, fill=cor.AMBAR, width=1)
+        if self.retangulo is not None:
+            self.canvas.tag_raise(self.retangulo)
+
+    def _iniciar(self, evento) -> None:
+        self.inicio = (evento.x, evento.y)
+        if self.retangulo is not None:
+            self.canvas.delete(self.retangulo)
+        self.retangulo = self.canvas.create_rectangle(
+            evento.x, evento.y, evento.x, evento.y,
+            outline=cor.AMBAR, width=2, fill=cor.AMBAR, stipple="gray25",
+        )
+
+    def _arrastar(self, evento) -> None:
+        if self.inicio is not None and self.retangulo is not None:
+            self.canvas.coords(self.retangulo, *self.inicio, evento.x, evento.y)
+
+    def _soltar(self, evento) -> None:
+        if self.inicio is None:
+            return
+        x1, x2 = sorted((self.inicio[0], evento.x))
+        y1, y2 = sorted((self.inicio[1], evento.y))
+        if x2 - x1 < 3 or y2 - y1 < 3:
+            return
+        recorte = self.imagem.crop((x1, y1, x2, y2))
+        centro_x = self.monitor_virtual["left"] + (x1 + x2) // 2
+        centro_y = self.monitor_virtual["top"] + (y1 + y2) // 2
+        monitor_id = 1
+        for indice, monitor in enumerate(self.monitores, start=1):
+            if (monitor["left"] <= centro_x < monitor["left"] + monitor["width"]
+                    and monitor["top"] <= centro_y < monitor["top"] + monitor["height"]):
+                monitor_id = indice
+                break
+        self.janela.destroy()
+        self.ao_capturar(recorte, monitor_id)
+
+    def cancelar(self, _evento=None) -> None:
+        if self.janela.winfo_exists():
+            self.janela.destroy()
+        self.ao_cancelar()
+
+
+# ==================== ui/janela.py ====================
+
+
+
+import json
+import queue
+import threading
+import time
+import webbrowser
+from copy import deepcopy
+from pathlib import Path
+import customtkinter as ctk
+import pyautogui
+from PIL import Image
+
+
+
+class JanelaCerbero(ctk.CTk):
+    def __init__(self):
+        ctk.set_appearance_mode("Dark")
+        super().__init__()
+        self.raiz_dados = Path(__file__).resolve().parent
+        self.repositorio = RepositorioPerfis(self.raiz_dados)
+        self.eventos: queue.Queue = queue.Queue()
+        self.config_path = self.raiz_dados / "configuracoes.json"
+        self.config = self._ler_config()
+        self.executor = Executor(
+            self.raiz_dados, self.eventos,
+            restringir_monitor=self.config["restringir_monitor"],
+            direct_input=self.config["pydirectinput"],
+        )
+        self.perfis = self.repositorio.listar()
+        if not self.perfis:
+            perfil_inicial = Perfil("padrao")
+            self.repositorio.salvar(perfil_inicial)
+            self.perfis = ["padrao"]
+        self.perfil_atual = self.repositorio.carregar(self.perfis[0])
+        self.indice_selecionado: int | None = None
+        self.modo = self.perfil_atual.modo
+        self.ciclos = self.perfil_atual.ciclos
+        self.inicio_ativo: float | None = None
+        self.ciclo_atual = 0
+        self.status_atual = "ocioso"
+        self.minimizado_por_execucao = False
+        self.minimizado_por_teste = False
+        self.overlay: OverlayCaptura | None = None
+        self._preview_ref = None
+        self._criar_variaveis()
+        self._montar_janela()
+        self._montar_interface()
+        self._atualizar_perfis()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+        self._atualizar_relogio()
+        self._emitir_avisos_perfis()
+        self.after(80, self._consumir_eventos)
+        self.protocol("WM_DELETE_WINDOW", self._fechar)
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.05
+
+    def _ler_config(self) -> dict:
+        padrao = {
+            "pydirectinput": False,
+            "restringir_monitor": False,
+            "bip": False,
+            "modulo_web": True,
+            "minimizar_ao_executar": True,
+        }
+        try:
+            dados = json.loads(self.config_path.read_text(encoding="utf-8"))
+            padrao.update({k: v for k, v in dados.items() if k in padrao})
+        except (OSError, ValueError, TypeError):
+            pass
+        return padrao
+
+    def _salvar_config(self) -> None:
+        temporario = self.config_path.with_suffix(".json.tmp")
+        temporario.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+        temporario.replace(self.config_path)
+
+    def _criar_variaveis(self) -> None:
+        self.acao_var = ctk.StringVar(value="clique")
+        self.modo_var = ctk.StringVar(value=self.modo.upper())
+        self.ciclos_var = ctk.StringVar(value=str(self.ciclos))
+        self.confianca_var = ctk.DoubleVar(value=0.85)
+        self.confianca_texto = ctk.StringVar(value="0.85")
+        self.humano_var = ctk.BooleanVar(value=False)
+        self.url_var = ctk.StringVar(value="")
+        self.delay_var = ctk.StringVar(value="450")
+        self.tentativas_var = ctk.StringVar(value="5")
+        self.intervalo_var = ctk.StringVar(value="400")
+        self.scroll_var = ctk.StringVar(value="500")
+
+    def _montar_janela(self) -> None:
+        self.title("CÉRBERO · PAINEL DE OPERAÇÃO")
+        self.configure(fg_color=cor.FUNDO)
+        self.geometry("1420x900")
+        self.minsize(1060, 690)
+        if __import__("sys").platform == "win32":
+            try:
+                self.state("zoomed")
+            except Exception:
+                pass
+        else:
+            self.attributes("-zoomed", True)
+
+    def _montar_interface(self) -> None:
+        self.grid_columnconfigure(0, weight=0, minsize=225)
+        self.grid_columnconfigure(1, weight=1, minsize=430)
+        self.grid_columnconfigure(2, weight=0, minsize=305)
+        self.grid_rowconfigure(1, weight=1)
+
+        self._cabecalho()
+        self._coluna_perfis()
+        self._coluna_fila()
+        self._coluna_inspecao()
+        self._controles_execucao()
+        self._painel_log()
+        self._barra_status()
+
+    def _cabecalho(self) -> None:
+        cab = painel(self, height=58)
+        cab.grid(row=0, column=0, columnspan=3, sticky="ew", padx=8, pady=(8, 5))
+        cab.grid_columnconfigure(1, weight=1)
+        rotulo(cab, "C É R B E R O", cor_texto=cor.AMBAR, tamanho=16).grid(
+            row=0, column=0, padx=(18, 10), pady=10, sticky="w"
+        )
+        rotulo(cab, "·  PAINEL DE OPERAÇÃO", cor_texto=cor.OLIVA, tamanho=11).grid(
+            row=0, column=1, padx=8, sticky="w"
+        )
+        self.relogio_cab = rotulo(cab, "[usuario@local]   ⟨00:00:00⟩", cor_texto=cor.AMBAR, tamanho=11)
+        self.relogio_cab.grid(row=0, column=2, padx=18, sticky="e")
+        botao(cab, "CONFIGURAÇÕES", self._abrir_configuracoes, width=132, height=28).grid(
+            row=0, column=3, padx=(0, 12), pady=8
+        )
+
+    def _coluna_perfis(self) -> None:
+        self.col_esquerda = painel(self)
+        self.col_esquerda.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=4)
+        self.col_esquerda.grid_columnconfigure(0, weight=1)
+        rotulo(self.col_esquerda, "P E R F I S", cor_texto=cor.AMBAR, tamanho=12).grid(
+            row=0, column=0, sticky="ew", padx=14, pady=(14, 8)
+        )
+        self.lista_perfis = ctk.CTkScrollableFrame(
+            self.col_esquerda, fg_color=cor.PAINEL, corner_radius=0,
+            scrollbar_button_color=cor.OLIVA, scrollbar_button_hover_color=cor.AMBAR_QUEIMADO,
+        )
+        self.lista_perfis.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 10))
+        self.col_esquerda.grid_rowconfigure(1, weight=1)
+        botao(self.col_esquerda, "+  NOVO PERFIL", self._novo_perfil).grid(
+            row=2, column=0, sticky="ew", padx=10, pady=(0, 14)
+        )
+        self.area_web = painel(self.col_esquerda)
+        self.area_web.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.area_web.grid_columnconfigure(0, weight=1)
+        rotulo(self.area_web, "F E R R A M E N T A S", cor_texto=cor.AMBAR, tamanho=10).grid(
+            row=0, column=0, sticky="ew", padx=10, pady=(10, 8)
+        )
+        rotulo(self.area_web, "URL", cor_texto=cor.OLIVA, tamanho=10).grid(
+            row=1, column=0, sticky="ew", padx=10, pady=(0, 3)
+        )
+        entrada(self.area_web, textvariable=self.url_var).grid(
+            row=2, column=0, sticky="ew", padx=10, pady=(0, 8)
+        )
+        botoes = ctk.CTkFrame(self.area_web, fg_color="transparent")
+        botoes.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        botoes.grid_columnconfigure(0, weight=1)
+        botoes.grid_columnconfigure(1, weight=1)
+        botao(botoes, "ABRIR", self._abrir_url, height=30).grid(row=0, column=0, sticky="ew", padx=2)
+        botao(botoes, "GOOGLE", self._abrir_google, height=30).grid(row=0, column=1, sticky="ew", padx=2)
+        if not self.config["modulo_web"]:
+            self.area_web.grid_remove()
+
+    def _coluna_fila(self) -> None:
+        self.col_centro = painel(self)
+        self.col_centro.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
+        self.col_centro.grid_rowconfigure(1, weight=1)
+        self.col_centro.grid_columnconfigure(0, weight=1)
+        topo = ctk.CTkFrame(self.col_centro, fg_color="transparent")
+        topo.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        topo.grid_columnconfigure(0, weight=1)
+        rotulo(topo, "F I L A   D E   E X E C U Ç Ã O", cor_texto=cor.AMBAR, tamanho=11).grid(row=0, column=0, sticky="w")
+        self.contagem_alvos = rotulo(topo, "ALVOS: 0", cor_texto=cor.OLIVA, tamanho=10)
+        self.contagem_alvos.grid(row=0, column=1, sticky="e")
+        self.lista_fila = ctk.CTkScrollableFrame(
+            self.col_centro, fg_color=cor.FUNDO, corner_radius=0,
+            scrollbar_button_color=cor.OLIVA, scrollbar_button_hover_color=cor.AMBAR_QUEIMADO,
+        )
+        self.lista_fila.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        self.lista_fila.grid_columnconfigure(0, weight=1)
+        rodape = ctk.CTkFrame(self.col_centro, fg_color="transparent")
+        rodape.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 10))
+        for indice, (texto, cmd) in enumerate((
+            ("+", self._capturar), ("−", self._remover_alvo), ("▲", lambda: self._mover_alvo(-1)),
+            ("▼", lambda: self._mover_alvo(1)),
+        )):
+            botao(rodape, texto, cmd, width=44, height=30).grid(row=0, column=indice, padx=3)
+
+    def _coluna_inspecao(self) -> None:
+        self.col_direita = painel(self)
+        self.col_direita.grid(row=1, column=2, sticky="nsew", padx=(4, 8), pady=4)
+        self.col_direita.grid_columnconfigure(0, weight=1)
+        self.col_direita.grid_rowconfigure(2, weight=1)
+        rotulo(self.col_direita, "I N S P E Ç Ã O", cor_texto=cor.AMBAR, tamanho=12).grid(
+            row=0, column=0, sticky="ew", padx=14, pady=(12, 8)
+        )
+        self.preview_box = painel(self.col_direita, height=205)
+        self.preview_box.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.preview_box.grid_propagate(False)
+        self.preview = rotulo(self.preview_box, "[ NENHUM ALVO SELECIONADO ]", cor_texto=cor.OLIVA, tamanho=10)
+        self.preview.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.editor = ctk.CTkScrollableFrame(
+            self.col_direita, fg_color=cor.PAINEL, corner_radius=0,
+            scrollbar_button_color=cor.OLIVA, scrollbar_button_hover_color=cor.AMBAR_QUEIMADO,
+        )
+        self.editor.grid(row=2, column=0, sticky="nsew", padx=8, pady=0)
+        self.editor.grid_columnconfigure(0, weight=1)
+        rotulo(self.editor, "AÇÃO", cor_texto=cor.OLIVA, tamanho=10).grid(
+            row=0, column=0, sticky="ew", padx=7, pady=(7, 3)
+        )
+        self.acao_menu = ctk.CTkOptionMenu(
+            self.editor, values=["clique", "clique_duplo", "clique_direito", "digitar", "tecla", "scroll", "esperar", "pausar_ate_encontrar"],
+            variable=self.acao_var, command=self._acao_alterada,
+            fg_color=cor.FUNDO, button_color=cor.BORDAS, button_hover_color=cor.AMBAR_QUEIMADO,
+            text_color=cor.PERGAMINHO, dropdown_fg_color=cor.PAINEL,
+            dropdown_text_color=cor.PERGAMINHO, dropdown_hover_color=cor.BORDAS,
+            corner_radius=0, font=fonte(self, 10), dropdown_font=fonte(self, 10), height=30,
+        )
+        self.acao_menu.grid(row=1, column=0, sticky="ew", padx=7, pady=(0, 9))
+        self.rotulo_texto = rotulo(self.editor, "TEXTO / CHAVE", cor_texto=cor.OLIVA, tamanho=10)
+        self.rotulo_texto.grid(row=2, column=0, sticky="ew", padx=7, pady=(0, 3))
+        self.campo_texto = entrada(self.editor, largura=230)
+        self.campo_texto.grid(row=3, column=0, sticky="ew", padx=7, pady=(0, 8))
+        self.humano_check = ctk.CTkCheckBox(
+            self.editor, text="DIGITAÇÃO HUMANA  40–120 MS", variable=self.humano_var,
+            fg_color=cor.AMBAR, hover_color=cor.AMBAR_QUEIMADO,
+            border_color=cor.BORDAS, text_color=cor.PERGAMINHO,
+            checkmark_color=cor.FUNDO, corner_radius=0, font=fonte(self, 9),
+            command=self._salvar_edicao,
+        )
+        self.humano_check.grid(row=4, column=0, sticky="w", padx=7, pady=(0, 9))
+        self._campo_numerico("DELAY PÓS-AÇÃO (MS)", self.delay_var, 5)
+        rotulo(self.editor, "CONFIANÇA MÍNIMA", cor_texto=cor.OLIVA, tamanho=10).grid(
+            row=7, column=0, sticky="ew", padx=7, pady=(4, 0)
+        )
+        self.confianca_slider = ctk.CTkSlider(
+            self.editor, from_=0.50, to=0.99, number_of_steps=49,
+            variable=self.confianca_var, command=self._conf_alterada,
+            fg_color=cor.BORDAS, progress_color=cor.AMBAR,
+            button_color=cor.AMBAR, button_hover_color=cor.AMBAR_QUEIMADO,
+            corner_radius=0, button_corner_radius=0,
+        )
+        self.confianca_slider.grid(row=8, column=0, sticky="ew", padx=7, pady=(4, 0))
+        self.confianca_slider.bind("<ButtonRelease-1>", self._salvar_edicao, add="+")
+        self.confianca_num = rotulo(self.editor, "0.85", cor_texto=cor.AMBAR, tamanho=10)
+        self.confianca_num.grid(row=9, column=0, sticky="e", padx=7, pady=(0, 7))
+        self._campo_numerico("TENTATIVAS / INTERVALO (MS)", self.tentativas_var, 10)
+        self._campo_numerico("", self.intervalo_var, 12, placeholder="INTERVALO ENTRE TENTATIVAS")
+        self._campo_numerico("SCROLL (PIXELS APROX.; NEGATIVO = ABAIXO)", self.scroll_var, 14)
+        self._salvar_editor_btn = botao(self.editor, "SALVAR CONFIGURAÇÃO", self._salvar_edicao)
+        self._salvar_editor_btn.grid(row=16, column=0, sticky="ew", padx=7, pady=(8, 10))
+        self._human_row = 4
+        botao(self.col_direita, "CAPTURAR TELA", self._capturar, destaque=True).grid(
+            row=3, column=0, sticky="ew", padx=10, pady=(10, 4)
+        )
+        botao(self.col_direita, "TESTAR ALVO", self._testar_alvo).grid(
+            row=4, column=0, sticky="ew", padx=10, pady=4
+        )
+        botao(self.col_direita, "DUPLICAR", self._duplicar_alvo).grid(
+            row=5, column=0, sticky="ew", padx=10, pady=(4, 10)
+        )
+
+    def _campo_numerico(self, titulo: str, variavel, linha: int, placeholder: str | None = None) -> None:
+        texto = titulo or placeholder or ""
+        rotulo(self.editor, texto, cor_texto=cor.OLIVA, tamanho=9).grid(
+            row=linha, column=0, sticky="ew", padx=7, pady=(3, 2)
+        )
+        campo = entrada(self.editor, largura=140, textvariable=variavel, placeholder_text=placeholder)
+        campo.grid(row=linha + 1, column=0, sticky="ew", padx=7, pady=(0, 5))
+        campo.bind("<FocusOut>", lambda _e: self._salvar_edicao())
+        campo.bind("<Return>", lambda _e: self._salvar_edicao())
+
+    def _controles_execucao(self) -> None:
+        linha = painel(self, height=54)
+        linha.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(3, 4))
+        linha.grid_columnconfigure(4, weight=1)
+        botao(linha, "▶  EXECUTAR", self._executar, destaque=True, width=160).grid(
+            row=0, column=0, padx=(12, 5), pady=8
+        )
+        botao(linha, "■  PARAR", self._parar, width=125).grid(row=0, column=1, padx=5, pady=8)
+        botao(linha, "⟲  RESETAR", self._resetar, width=135).grid(row=0, column=2, padx=5, pady=8)
+        rotulo(linha, "MODO:", cor_texto=cor.OLIVA, tamanho=10).grid(row=0, column=3, padx=(18, 5), sticky="e")
+        self.modo_menu = ctk.CTkOptionMenu(
+            linha, values=["SIMPLES", "LOOP", "CICLOS"], variable=self.modo_var,
+            command=self._modo_alterado, fg_color=cor.FUNDO,
+            button_color=cor.BORDAS, button_hover_color=cor.AMBAR_QUEIMADO,
+            text_color=cor.PERGAMINHO, dropdown_fg_color=cor.PAINEL,
+            dropdown_text_color=cor.PERGAMINHO, dropdown_hover_color=cor.BORDAS,
+            corner_radius=0, font=fonte(self, 10), height=30, width=112,
+        )
+        self.modo_menu.grid(row=0, column=4, sticky="e", padx=5, pady=8)
+        self.ciclos_entry = entrada(linha, largura=65, textvariable=self.ciclos_var)
+        self.ciclos_entry.grid(row=0, column=5, padx=(5, 12), pady=8)
+        self.ciclos_entry.bind("<FocusOut>", lambda _e: self._salvar_modo())
+        self.ciclos_entry.bind("<Return>", lambda _e: self._salvar_modo())
+
+    def _painel_log(self) -> None:
+        caixa = painel(self)
+        caixa.grid(row=3, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        caixa.grid_columnconfigure(0, weight=1)
+        self.log = ctk.CTkTextbox(
+            caixa, height=120, fg_color=cor.FUNDO, text_color=cor.PERGAMINHO,
+            border_color=cor.BORDAS, border_width=0, corner_radius=0,
+            font=fonte(self, 10), wrap="none",
+        )
+        self.log.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        self.log.tag_config("ok", foreground=cor.SALVIA)
+        self.log.tag_config("erro", foreground=cor.SANGUE)
+        self.log.tag_config("info", foreground=cor.AMBAR)
+        self.log.tag_config("tempo", foreground=cor.OLIVA)
+        self.log.configure(state="disabled")
+
+    def _barra_status(self) -> None:
+        barra = ctk.CTkFrame(self, fg_color=cor.PAINEL, corner_radius=0, height=28)
+        barra.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 8))
+        barra.grid_columnconfigure(0, weight=1)
+        self.status_label = rotulo(
+            barra, "STATUS: OCIOSO  ·  ALVOS: 0  ·  CICLO: 0  ·  TEMPO ATIVO: 00:00:00",
+            cor_texto=cor.OLIVA, tamanho=10,
+        )
+        self.status_label.grid(row=0, column=0, sticky="ew", padx=10, pady=4)
+
+    def _atualizar_perfis(self) -> None:
+        for widget in self.lista_perfis.winfo_children():
+            widget.destroy()
+        for nome in self.perfis:
+            atual = nome == self.perfil_atual.nome
+            texto = ("▌ " if atual else "  ") + nome
+            botao(
+                self.lista_perfis, texto, lambda n=nome: self._trocar_perfil(n),
+                destaque=atual, anchor="w", height=32,
+            ).pack(fill="x", padx=3, pady=2)
+
+    def _trocar_perfil(self, nome: str) -> None:
+        self._salvar_edicao()
+        self._salvar_perfil()
+        self.perfil_atual = self.repositorio.carregar(nome)
+        self._emitir_avisos_perfis()
+        self.modo = self.perfil_atual.modo
+        self.ciclos = self.perfil_atual.ciclos
+        self.modo_var.set(self.modo.upper())
+        self.ciclos_var.set(str(self.ciclos))
+        self.indice_selecionado = None
+        self._atualizar_perfis()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+        self._log_local("info", f"perfil carregado: {nome}")
+
+    def _novo_perfil(self) -> None:
+        self._salvar_edicao()
+        self._salvar_perfil()
+        nome = self._pedir_nome_perfil()
+        if not nome:
+            return
+        try:
+            seguro = nome_seguro(nome)
+        except ValueError as erro:
+            self._aviso("NOME INVÁLIDO", str(erro), erro=True)
+            return
+        if seguro in self.perfis:
+            self._aviso("PERFIL EXISTENTE", "Esse perfil já está na lista.")
+            return
+        self.perfil_atual = Perfil(seguro)
+        self.repositorio.salvar(self.perfil_atual)
+        self.perfis = self.repositorio.listar()
+        self.modo = "simples"
+        self.modo_var.set("SIMPLES")
+        self.ciclos_var.set("1")
+        self.indice_selecionado = None
+        self._atualizar_perfis()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    def _renderizar_fila(self) -> None:
+        for widget in self.lista_fila.winfo_children():
+            widget.destroy()
+        for indice, alvo in enumerate(self.perfil_atual.alvos):
+            selecionado = indice == self.indice_selecionado
+            linha = ctk.CTkFrame(
+                self.lista_fila, fg_color=cor.PAINEL if selecionado else cor.FUNDO,
+                border_color=cor.BORDAS, border_width=1, corner_radius=0,
+            )
+            linha.pack(fill="x", padx=4, pady=4)
+            linha.grid_columnconfigure(1, weight=1)
+            for widget in (linha,):
+                widget.bind("<Button-1>", lambda _e, i=indice: self._selecionar_alvo(i))
+            ordem = rotulo(linha, f"{indice + 1:02d}", cor_texto=cor.AMBAR, tamanho=14, width=40)
+            ordem.grid(row=0, column=0, rowspan=2, padx=(10, 4), pady=7)
+            ordem.bind("<Button-1>", lambda _e, i=indice: self._selecionar_alvo(i))
+            nome = rotulo(linha, f"▣  {alvo.nome}", cor_texto=cor.PERGAMINHO, tamanho=11)
+            nome.grid(row=0, column=1, sticky="ew", padx=6, pady=(7, 2))
+            nome.bind("<Button-1>", lambda _e, i=indice: self._selecionar_alvo(i))
+            acao = rotulo(linha, f"ação: {alvo.acao}    ·    espera: {alvo.delay_ms} ms", cor_texto=cor.OLIVA, tamanho=9)
+            acao.grid(row=1, column=1, sticky="ew", padx=6, pady=(0, 7))
+            acao.bind("<Button-1>", lambda _e, i=indice: self._selecionar_alvo(i))
+            estado = "selecionado" if selecionado else "aguardando"
+            st = rotulo(linha, f"status: {estado}", cor_texto=cor.AMBAR if selecionado else cor.OLIVA, tamanho=9)
+            st.grid(row=0, column=2, rowspan=2, padx=10)
+            st.bind("<Button-1>", lambda _e, i=indice: self._selecionar_alvo(i))
+        self.contagem_alvos.configure(text=f"ALVOS: {len(self.perfil_atual.alvos)}")
+        self._atualizar_status()
+
+    def _selecionar_alvo(self, indice: int) -> None:
+        if self.indice_selecionado == indice:
+            return
+        self._salvar_edicao()
+        self.indice_selecionado = indice
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    def _atualizar_inspecao(self) -> None:
+        alvo = self._alvo_selecionado()
+        if not alvo:
+            self._limpar_preview("[ NENHUM ALVO SELECIONADO ]")
+            self.acao_var.set("clique")
+            self.campo_texto.delete(0, "end")
+            self.delay_var.set("450")
+            self.confianca_var.set(0.85)
+            self.confianca_num.configure(text="0.85")
+            self.tentativas_var.set("5")
+            self.intervalo_var.set("400")
+            self.scroll_var.set("500")
+            self.humano_var.set(False)
+            return
+        imagem = carregar_preview(self.raiz_dados, alvo)
+        if imagem:
+            ctk_imagem = ctk.CTkImage(light_image=imagem, dark_image=imagem, size=imagem.size)
+            self.preview.configure(image=ctk_imagem)
+            self._preview_ref = ctk_imagem
+            self.preview.configure(text="")
+        else:
+            self._limpar_preview("[ ARQUIVO DE ALVO AUSENTE ]")
+        self.acao_var.set(alvo.acao)
+        self.campo_texto.delete(0, "end")
+        self.campo_texto.insert(0, alvo.texto if alvo.acao == "digitar" else alvo.tecla)
+        self.delay_var.set(str(alvo.delay_ms))
+        self.confianca_var.set(alvo.confianca)
+        self.confianca_num.configure(text=f"{alvo.confianca:.2f}")
+        self.tentativas_var.set(str(alvo.tentativas))
+        self.intervalo_var.set(str(alvo.intervalo_tentativa_ms))
+        self.scroll_var.set(str(alvo.scroll_pixels))
+        self.humano_var.set(alvo.digitar_humano)
+        self._acao_alterada(alvo.acao, salvar=False)
+
+    def _limpar_preview(self, texto: str) -> None:
+        # CustomTkinter 5.2.x não limpa o tk.Label interno quando recebe image=None.
+        # Retire a referência Tcl antes de liberar o CTkImage para evitar pyimageN órfã.
+        rotulo_interno = getattr(self.preview, "_label", None)
+        if rotulo_interno is not None:
+            rotulo_interno.configure(image="")
+        self.preview.configure(image=None)
+        self._preview_ref = None
+        self.preview.configure(text=texto)
+
+    def _alvo_selecionado(self) -> Alvo | None:
+        if self.indice_selecionado is None or not (0 <= self.indice_selecionado < len(self.perfil_atual.alvos)):
+            return None
+        return self.perfil_atual.alvos[self.indice_selecionado]
+
+    def _acao_alterada(self, acao: str, salvar: bool = True) -> None:
+        if acao == "digitar":
+            self.rotulo_texto.configure(text="TEXTO")
+            self.humano_check.grid()
+        elif acao == "tecla":
+            self.rotulo_texto.configure(text="TECLA / COMBINAÇÃO")
+            self.humano_check.grid_remove()
+        elif acao == "scroll":
+            self.rotulo_texto.configure(text="ALVO PARA ROLAR")
+            self.humano_check.grid_remove()
+        else:
+            self.rotulo_texto.configure(text="TEXTO / CHAVE")
+            self.humano_check.grid_remove()
+        if salvar:
+            self._salvar_edicao()
+
+    def _conf_alterada(self, valor: float) -> None:
+        self.confianca_num.configure(text=f"{float(valor):.2f}")
+
+    def _salvar_edicao(self, _evento=None) -> None:
+        alvo = self._alvo_selecionado()
+        if not alvo or not hasattr(self, "campo_texto"):
+            return
+        try:
+            alvo.delay_ms = max(0, int(self.delay_var.get() or 0))
+            alvo.tentativas = max(1, int(self.tentativas_var.get() or 5))
+            alvo.intervalo_tentativa_ms = max(0, int(self.intervalo_var.get() or 400))
+            alvo.scroll_pixels = int(self.scroll_var.get() or 500)
+            alvo.confianca = min(0.99, max(0.50, float(self.confianca_var.get())))
+        except ValueError:
+            return
+        alvo.acao = self.acao_var.get()
+        valor = self.campo_texto.get()
+        if alvo.acao == "digitar":
+            alvo.texto = valor
+        elif alvo.acao == "tecla":
+            alvo.tecla = valor or "enter"
+        alvo.digitar_humano = bool(self.humano_var.get())
+        try:
+            salvar_metadados(alvo, (self.raiz_dados / alvo.arquivo).with_suffix(".json"))
+        except OSError as erro:
+            self._log_local("erro", f"não foi possível salvar o alvo: {erro}")
+        self._salvar_perfil()
+        if hasattr(self, "lista_fila"):
+            self._renderizar_fila()
+
+    def _salvar_perfil(self) -> None:
+        try:
+            self.perfil_atual.modo = self.modo
+            self.perfil_atual.ciclos = max(1, self.ciclos)
+            self.repositorio.salvar(self.perfil_atual)
+        except (OSError, ValueError) as erro:
+            self._log_local("erro", f"erro salvando perfil: {erro}")
+
+    def _modo_alterado(self, modo: str) -> None:
+        self.modo = modo.lower()
+        self._salvar_perfil()
+
+    def _salvar_modo(self) -> None:
+        try:
+            self.ciclos = max(1, int(self.ciclos_var.get()))
+        except ValueError:
+            self.ciclos = 1
+            self.ciclos_var.set("1")
+        self._salvar_perfil()
+
+    def _capturar(self) -> None:
+        if self.executor.ativo:
+            self._log_local("erro", "pare a execução antes de capturar uma tela")
+            return
+        self._salvar_edicao()
+        self.iconify()
+        self.after(500, self._abrir_overlay)
+
+    def _abrir_overlay(self) -> None:
+        try:
+            self.overlay = OverlayCaptura(self, self._captura_concluida, self._captura_cancelada)
+        except Exception as erro:
+            self.deiconify()
+            self._aviso("CAPTURA INDISPONÍVEL", str(erro), erro=True)
+
+    def _captura_concluida(self, imagem: Image.Image, monitor: int) -> None:
+        self.overlay = None
+        self.deiconify()
+        self.lift()
+        try:
+            novo = salvar_alvo(
+                imagem, self.raiz_dados, self.perfil_atual.nome, monitor,
+                len(self.perfil_atual.alvos) + 1,
+            )
+            self.perfil_atual.alvos.append(novo)
+            self.indice_selecionado = len(self.perfil_atual.alvos) - 1
+            self._salvar_perfil()
+            self._renderizar_fila()
+            self._atualizar_inspecao()
+            self._log_local("ok", f"alvo capturado: {novo.nome} · monitor {monitor}")
+        except Exception as erro:
+            self._aviso("ERRO DE CAPTURA", str(erro), erro=True)
+
+    def _captura_cancelada(self) -> None:
+        self.overlay = None
+        self.deiconify()
+        self.lift()
+
+    def _remover_alvo(self) -> None:
+        self._salvar_edicao()
+        alvo = self._alvo_selecionado()
+        if not alvo:
+            return
+        # Remove da fila; preserva o PNG e o JSON no perfil para evitar perda acidental.
+        alvo.in_queue = False
+        try:
+            salvar_metadados(alvo, (self.raiz_dados / alvo.arquivo).with_suffix(".json"))
+        except OSError as erro:
+            alvo.in_queue = True
+            self._log_local("erro", f"não foi possível salvar a remoção: {erro}")
+            return
+        del self.perfil_atual.alvos[self.indice_selecionado]
+        if self.perfil_atual.alvos:
+            self.indice_selecionado = min(self.indice_selecionado, len(self.perfil_atual.alvos) - 1)
+        else:
+            self.indice_selecionado = None
+        self._salvar_perfil()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    def _mover_alvo(self, direcao: int) -> None:
+        self._salvar_edicao()
+        indice = self.indice_selecionado
+        destino = None if indice is None else indice + direcao
+        if destino is None or not 0 <= destino < len(self.perfil_atual.alvos):
+            return
+        self.perfil_atual.alvos[indice], self.perfil_atual.alvos[destino] = (
+            self.perfil_atual.alvos[destino], self.perfil_atual.alvos[indice]
+        )
+        self.indice_selecionado = destino
+        self._salvar_perfil()
+        self._renderizar_fila()
+        self._atualizar_inspecao()
+
+    def _duplicar_alvo(self) -> None:
+        self._salvar_edicao()
+        atual = self._alvo_selecionado()
+        if not atual:
+            return
+        caminho = self.raiz_dados / atual.arquivo
+        try:
+            with Image.open(caminho) as img:
+                copia = salvar_alvo(
+                    img.copy(), self.raiz_dados, self.perfil_atual.nome,
+                    atual.monitor_origem, len(self.perfil_atual.alvos) + 1,
+                    nome=f"{atual.nome}_copia",
+                )
+            for campo in ("acao", "texto", "delay_ms", "confianca", "tentativas", "intervalo_tentativa_ms", "digitar_humano", "scroll_pixels", "tecla"):
+                setattr(copia, campo, deepcopy(getattr(atual, campo)))
+            salvar_metadados(copia, (self.raiz_dados / copia.arquivo).with_suffix(".json"))
+            self.perfil_atual.alvos.append(copia)
+            self.indice_selecionado = len(self.perfil_atual.alvos) - 1
+            self._salvar_perfil()
+            self._renderizar_fila()
+            self._atualizar_inspecao()
+        except OSError as erro:
+            self._aviso("ERRO AO DUPLICAR", str(erro), erro=True)
+
+    def _testar_alvo(self) -> None:
+        if self.executor.ativo:
+            self._log_local("erro", "pare a execução antes de testar um alvo")
+            return
+        alvo = self._alvo_selecionado()
+        if not alvo:
+            self._log_local("erro", "selecione um alvo para testar")
+            return
+        self._salvar_edicao()
+        alvo_copia = deepcopy(alvo)
+        restringir = self.config["restringir_monitor"]
+        self._log_local("info", f"testando alvo: {alvo.nome}")
+
+        def worker():
+            try:
+                resultado = localizar(
+                    self.raiz_dados / alvo_copia.arquivo,
+                    alvo_copia.confianca,
+                    alvo_copia.tentativas,
+                    alvo_copia.intervalo_tentativa_ms,
+                    alvo_copia.monitor_origem,
+                    restringir,
+                )
+                self.eventos.put(("teste", resultado, alvo_copia.nome))
+            except Exception as erro:
+                self.eventos.put(("teste_erro", str(erro), alvo_copia.nome))
+
+        def iniciar_teste():
+            threading.Thread(target=worker, name="cerbero-teste-alvo", daemon=True).start()
+
+        if self.config["minimizar_ao_executar"]:
+            self.minimizado_por_teste = True
+            self.iconify()
+            self.after(400, iniciar_teste)
+        else:
+            iniciar_teste()
+
+    def _executar(self) -> None:
+        self._salvar_edicao()
+        self._salvar_modo()
+        if self.config["bip"]:
+            threading.Thread(target=self._bip, daemon=True).start()
+
+        def iniciar_motor():
+            iniciado = self.executor.iniciar(self.perfil_atual, self.modo, self.ciclos)
+            if not iniciado and self.minimizado_por_execucao:
+                self.minimizado_por_execucao = False
+                self.deiconify()
+                self.lift()
+
+        if self.config["minimizar_ao_executar"]:
+            self.minimizado_por_execucao = True
+            self.iconify()
+            self.after(500, iniciar_motor)
+        else:
+            iniciar_motor()
+
+    @staticmethod
+    def _bip() -> None:
+        try:
+            import winsound
+
+            winsound.Beep(440, 150)
+        except (ImportError, RuntimeError):
+            pass
+
+    def _parar(self) -> None:
+        self.executor.parar()
+
+    def _resetar(self) -> None:
+        if self.executor.ativo:
+            self.executor.parar("execução parada para reset")
+        self.ciclo_atual = 0
+        self.inicio_ativo = None
+        self.status_atual = "ocioso"
+        self._atualizar_status()
+
+    def _abrir_url(self) -> None:
+        url = self.url_var.get().strip()
+        if not url:
+            return
+        if "://" not in url:
+            url = "https://" + url
+        webbrowser.open(url)
+        self._log_local("info", f"abrindo {url}")
+
+    def _abrir_google(self) -> None:
+        webbrowser.open("https://google.com")
+        self.after(900, self._focar_busca)
+
+    def _focar_busca(self) -> None:
+        try:
+            pyautogui.hotkey("ctrl", "l")
+        except Exception as erro:
+            self._log_local("erro", f"não foi possível focar a barra do navegador: {erro}")
+
+    def _pedir_nome_perfil(self) -> str | None:
+        janela = ctk.CTkToplevel(self)
+        janela.title("NOVO PERFIL")
+        janela.configure(fg_color=cor.FUNDO)
+        janela.geometry("390x160")
+        janela.resizable(False, False)
+        janela.transient(self)
+        janela.grab_set()
+        resultado: dict[str, str | None] = {"nome": None}
+        caixa = painel(janela)
+        caixa.pack(fill="both", expand=True, padx=9, pady=9)
+        rotulo(caixa, "NOME DO PERFIL", cor_texto=cor.AMBAR, tamanho=12).pack(anchor="w", padx=12, pady=(12, 5))
+        campo = entrada(caixa, largura=340)
+        campo.pack(fill="x", padx=12, pady=4)
+
+        def confirmar(_evento=None):
+            resultado["nome"] = campo.get().strip() or None
+            janela.destroy()
+
+        acoes = ctk.CTkFrame(caixa, fg_color="transparent")
+        acoes.pack(fill="x", padx=12, pady=(5, 9))
+        botao(acoes, "CANCELAR", janela.destroy, width=100).pack(side="right", padx=(5, 0))
+        botao(acoes, "CRIAR", confirmar, destaque=True, width=100).pack(side="right")
+        janela.bind("<Return>", confirmar)
+        janela.bind("<Escape>", lambda _e: janela.destroy())
+        campo.focus_set()
+        self.wait_window(janela)
+        return resultado["nome"]
+
+    def _aviso(self, titulo: str, mensagem: str, erro: bool = False) -> None:
+        janela = ctk.CTkToplevel(self)
+        janela.title(titulo)
+        janela.configure(fg_color=cor.FUNDO)
+        janela.geometry("430x190")
+        janela.resizable(False, False)
+        janela.transient(self)
+        janela.grab_set()
+        caixa = painel(janela)
+        caixa.pack(fill="both", expand=True, padx=9, pady=9)
+        rotulo(caixa, titulo, cor_texto=cor.SANGUE if erro else cor.AMBAR, tamanho=12).pack(
+            anchor="w", padx=12, pady=(12, 8)
+        )
+        rotulo(caixa, mensagem, cor_texto=cor.PERGAMINHO, tamanho=10, wraplength=385, justify="left").pack(
+            fill="x", padx=12, pady=(0, 8)
+        )
+        botao(caixa, "FECHAR", janela.destroy, destaque=erro, width=110).pack(
+            side="right", padx=12, pady=9
+        )
+        janela.bind("<Escape>", lambda _e: janela.destroy())
+        janela.focus_force()
+
+    def _abrir_configuracoes(self) -> None:
+        janela = ctk.CTkToplevel(self)
+        janela.title("CONFIGURAÇÕES DO MOTOR")
+        janela.configure(fg_color=cor.FUNDO)
+        janela.geometry("460x370")
+        janela.resizable(False, False)
+        janela.transient(self)
+        janela.grab_set()
+        painel_config = painel(janela)
+        painel_config.pack(fill="both", expand=True, padx=10, pady=10)
+        rotulo(painel_config, "CONFIGURAÇÕES", cor_texto=cor.AMBAR, tamanho=14).pack(anchor="w", padx=14, pady=(14, 12))
+        vars_config = {k: ctk.BooleanVar(value=bool(self.config[k])) for k in self.config}
+        opcoes = (
+            ("pydirectinput", "MODO PYGAME · DIRECTINPUT"),
+            ("restringir_monitor", "BUSCAR SOMENTE NO MONITOR DE ORIGEM"),
+            ("bip", "BIP CURTO AO INICIAR"),
+            ("modulo_web", "EXIBIR FERRAMENTAS WEB"),
+            ("minimizar_ao_executar", "MINIMIZAR PAINEL DURANTE EXECUÇÃO E TESTE"),
+        )
+        for chave, titulo in opcoes:
+            ctk.CTkCheckBox(
+                painel_config, text=titulo, variable=vars_config[chave],
+                fg_color=cor.AMBAR, hover_color=cor.AMBAR_QUEIMADO,
+                border_color=cor.BORDAS, text_color=cor.PERGAMINHO,
+                checkmark_color=cor.FUNDO, corner_radius=0, font=fonte(self, 10),
+            ).pack(anchor="w", padx=15, pady=7)
+
+        def salvar_config():
+            self.config = {k: bool(v.get()) for k, v in vars_config.items()}
+            self._salvar_config()
+            self.executor.restringir_monitor = self.config["restringir_monitor"]
+            self.executor.direct_input = self.config["pydirectinput"]
+            if self.config["modulo_web"]:
+                self.area_web.grid()
+            else:
+                self.area_web.grid_remove()
+            janela.destroy()
+
+        botao(painel_config, "APLICAR", salvar_config, destaque=True).pack(fill="x", padx=14, pady=(15, 12))
+
+    def _consumir_eventos(self) -> None:
+        try:
+            while True:
+                evento = self.eventos.get_nowait()
+                if evento[0] == "log":
+                    _, nivel, mensagem = evento
+                    self._log_local(nivel, mensagem)
+                elif evento[0] == "status":
+                    _, estado, ciclo, inicio = evento
+                    self.status_atual = estado
+                    self.ciclo_atual = ciclo
+                    self.inicio_ativo = inicio if estado != "ocioso" else None
+                    if estado == "ocioso" and self.minimizado_por_execucao:
+                        self.minimizado_por_execucao = False
+                        self.deiconify()
+                        self.lift()
+                    self._atualizar_status()
+                elif evento[0] == "teste":
+                    _, resultado, nome = evento
+                    if self.minimizado_por_teste:
+                        self.minimizado_por_teste = False
+                        self.deiconify()
+                        self.lift()
+                    if resultado:
+                        self._log_local("ok", f"alvo {nome} localizado em {resultado.centro} · confiança {resultado.confianca:.2f}")
+                    else:
+                        self._log_local("erro", f"alvo {nome} não encontrado")
+                elif evento[0] == "teste_erro":
+                    _, erro, nome = evento
+                    if self.minimizado_por_teste:
+                        self.minimizado_por_teste = False
+                        self.deiconify()
+                        self.lift()
+                    self._log_local("erro", f"teste de {nome} falhou: {erro}")
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(80, self._consumir_eventos)
+
+    def _log_local(self, nivel: str, mensagem: str) -> None:
+        if not hasattr(self, "log"):
+            return
+        horario = time.strftime("%H:%M:%S")
+        self.log.configure(state="normal")
+        fim = self.log.index("end-1c")
+        self.log.insert("end", f"> {horario}  ", "tempo")
+        self.log.insert("end", mensagem + "\n", nivel if nivel in {"ok", "erro", "info"} else "info")
+        linhas = int(float(self.log.index("end-1c")))
+        if linhas > 500:
+            self.log.delete("1.0", f"{linhas - 500}.0")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _emitir_avisos_perfis(self) -> None:
+        while self.repositorio.avisos:
+            self._log_local("erro", self.repositorio.avisos.pop(0))
+
+    def _atualizar_status(self) -> None:
+        ativos = "00:00:00"
+        if self.inicio_ativo is not None and self.status_atual != "ocioso":
+            segundos = int(time.monotonic() - self.inicio_ativo)
+            horas, resto = divmod(segundos, 3600)
+            minutos, segundos = divmod(resto, 60)
+            ativos = f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+        self.status_label.configure(
+            text=f"STATUS: {self.status_atual.upper()}  ·  ALVOS: {len(self.perfil_atual.alvos)}  ·  "
+                 f"CICLO: {self.ciclo_atual}  ·  TEMPO ATIVO: {ativos}"
+        )
+
+    def _atualizar_relogio(self) -> None:
+        if not self.winfo_exists():
+            return
+        self.relogio_cab.configure(text=f"[usuario@local]   ⟨{time.strftime('%H:%M:%S')}⟩")
+        self._atualizar_status()
+        self.after(1000, self._atualizar_relogio)
+
+    def _fechar(self) -> None:
+        self._salvar_edicao()
+        self._salvar_perfil()
+        self.executor.parar("painel fechado")
+        if self.overlay is not None:
+            try:
+                self.overlay.janela.destroy()
+            except Exception:
+                pass
+        self.destroy()
+
+
+# ==================== main.py ====================
+
+
+
+import ctypes
+import sys
+
+
+def configurar_dpi() -> None:
+    """Alinha as coordenadas do Windows com as imagens capturadas pelo MSS."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
+
+
+def main() -> None:
+    configurar_dpi()
+
+    JanelaCerbero().mainloop()
+
+
+if __name__ == "__main__":
+    main()
